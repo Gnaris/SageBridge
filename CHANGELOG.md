@@ -1,5 +1,10 @@
 # Historique des versions
 
+## 1.2.2 — 20/10/2026
+
+- **Correction importante** : en quittant (ou pendant une mise à jour), SageBridge relâchait le dossier Sage ouvert par COM, ce qui pouvait figer Sage 50. Il s'arrête désormais sans toucher à la connexion COM, immédiatement (l'installateur de mise à jour n'attend plus).
+- Installateur : la touche Entrée valide toujours l'étape en cours (elle pouvait déclencher « Annuler »).
+
 ## 1.2.1 — 20/10/2026
 
 - Fenêtre : distingue « à jour » de « aucune version publiée » ; `/ping` indique la dernière version publiée, l'état des mises à jour automatiques et si le programme est la copie installée.
