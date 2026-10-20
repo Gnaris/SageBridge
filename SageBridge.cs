@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.2.2.0")]
-[assembly: AssemblyFileVersion("1.2.2.0")]
+[assembly: AssemblyVersion("1.2.3.0")]
+[assembly: AssemblyFileVersion("1.2.3.0")]
 
 namespace SageBridge
 {
@@ -101,6 +101,7 @@ namespace SageBridge
         public string DefaultClient = "";   // client utilisé quand la commande n'a pas d'adresse exploitable
         public string TestArticle = "";     // dernier code article utilisé pour la facture de test
         public bool AutoUpdate = true;      // installe seul les nouvelles versions publiées sur GitHub
+        public bool WriteReference = false; // écrire le champ « reference » reçu dans la Référence de la facture (désactivé par défaut)
         public string Repo = Updater.DefaultRepo;
 
         static readonly object logSync = new object();
@@ -152,6 +153,7 @@ namespace SageBridge
                 else if (k == "client") s.DefaultClient = v;
                 else if (k == "article_test") s.TestArticle = v;
                 else if (k == "maj_auto") s.AutoUpdate = v != "0";
+                else if (k == "reference_facture") s.WriteReference = v == "1";
                 else if (k == "depot" && Regex.IsMatch(v, @"^[\w.-]+/[\w.-]+$")) s.Repo = v;
             }
             return s;
@@ -165,6 +167,7 @@ namespace SageBridge
                 "client=" + DefaultClient + "\r\n" +
                 "article_test=" + TestArticle + "\r\n" +
                 "maj_auto=" + (AutoUpdate ? "1" : "0") + "\r\n" +
+                "reference_facture=" + (WriteReference ? "1" : "0") + "\r\n" +
                 "depot=" + Repo + "\r\n", Encoding.UTF8);
         }
 
@@ -1026,7 +1029,8 @@ namespace SageBridge
                 try { nomClient = (string)piece.Name; } catch { }
                 if (string.IsNullOrEmpty(nomClient)) throw new Exception("Client « " + clientCode + " » inconnu dans le dossier Sage.");
                 if (string.IsNullOrEmpty(res.ClientName)) res.ClientName = nomClient;
-                if (!string.IsNullOrEmpty(req.Reference)) { try { piece.reference = req.Reference; } catch (Exception e) { res.Messages.Add("Référence non enregistrée : " + ComMessage(e)); } }
+                // La Référence de la facture reste vide sauf si l'option est activée dans Réglages (demande de Boris, 20/10/2026).
+                if (cfg.WriteReference && !string.IsNullOrEmpty(req.Reference)) { try { piece.reference = req.Reference; } catch (Exception e) { res.Messages.Add("Référence non enregistrée : " + ComMessage(e)); } }
                 if (!string.IsNullOrEmpty(req.Remarque)) { try { piece.Remarque = req.Remarque; } catch (Exception e) { res.Messages.Add("Remarque non enregistrée : " + ComMessage(e)); } }
 
                 int n = 0;
@@ -1855,7 +1859,7 @@ namespace SageBridge
                 if (f.ShowDialog(this) != DialogResult.OK) return;
                 bool dossierChanged = f.Dossier != cfg.DossierPath;
                 bool portChanged = f.Port != cfg.Port;
-                cfg.DossierPath = f.Dossier; cfg.DefaultClient = f.Client; cfg.Port = f.Port; cfg.AutoUpdate = f.AutoUpdate;
+                cfg.DossierPath = f.Dossier; cfg.DefaultClient = f.Client; cfg.Port = f.Port; cfg.AutoUpdate = f.AutoUpdate; cfg.WriteReference = f.WriteReference;
                 cfg.Save();
                 RefreshDossierLabel();
                 LogLine("Réglages enregistrés.");
@@ -2120,8 +2124,9 @@ namespace SageBridge
     {
         readonly TextBox txtDossier, txtClient;
         readonly NumericUpDown numPort;
-        readonly CheckBox chkAuto;
+        readonly CheckBox chkAuto, chkRef;
         public bool AutoUpdate { get { return chkAuto.Checked; } }
+        public bool WriteReference { get { return chkRef.Checked; } }
         public string Dossier { get { return txtDossier.Text.Trim(); } }
         public string Client { get { return txtClient.Text.Trim(); } }
         public int Port { get { return (int)numPort.Value; } }
@@ -2156,10 +2161,13 @@ namespace SageBridge
             chkAuto = new CheckBox { Text = "Installer automatiquement les mises à jour (vérification au démarrage puis toutes les heures)", AutoSize = true, Checked = cfg.AutoUpdate, Margin = new Padding(3, 10, 3, 3) };
             g.Controls.Add(chkAuto, 0, 3);
             g.SetColumnSpan(chkAuto, 3);
-            g.Controls.Add(new Label { Text = "Source des mises à jour : github.com/" + cfg.Repo + "/releases", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 0, 4);
-            g.SetColumnSpan(g.GetControlFromPosition(0, 4), 3);
-            g.Controls.Add(new Label { Text = "Fichiers de SageBridge (réglages, historique, journal) : " + Settings.Dir, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 0, 5);
+            chkRef = new CheckBox { Text = "Écrire la référence de la commande dans le champ « Référence » de la facture", AutoSize = true, Checked = cfg.WriteReference, Margin = new Padding(3, 4, 3, 3) };
+            g.Controls.Add(chkRef, 0, 4);
+            g.SetColumnSpan(chkRef, 3);
+            g.Controls.Add(new Label { Text = "Source des mises à jour : github.com/" + cfg.Repo + "/releases", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 8, 3, 3) }, 0, 5);
             g.SetColumnSpan(g.GetControlFromPosition(0, 5), 3);
+            g.Controls.Add(new Label { Text = "Fichiers de SageBridge (réglages, historique, journal) : " + Settings.Dir, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 0, 6);
+            g.SetColumnSpan(g.GetControlFromPosition(0, 6), 3);
             Controls.Add(g);
             Controls.Add(Ui2.OkCancel(this, "Enregistrer"));
         }
