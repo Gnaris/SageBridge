@@ -234,7 +234,14 @@ namespace SageBridgeSetup
         {
             if (waitPid > 0)
             {
-                try { using (Process p = Process.GetProcessById(waitPid)) { if (!p.WaitForExit(30000)) { p.Kill(); p.WaitForExit(5000); } } }
+                try
+                {
+                    using (Process p = Process.GetProcessById(waitPid))
+                    {
+                        Log("Attente de la fermeture de SageBridge (PID " + waitPid + ")…");
+                        if (!p.WaitForExit(15000)) { Log("SageBridge ne s'est pas fermé : arrêt forcé."); p.Kill(); p.WaitForExit(5000); }
+                    }
+                }
                 catch { }
             }
             foreach (Process p in RunningApps())
@@ -556,6 +563,8 @@ namespace SageBridgeSetup
             btnNext.Text = i == 1 ? "Installer" : (i == 3 ? "Terminer" : "Suivant >");
             btnNext.Enabled = i != 2;
             btnCancel.Visible = i < 2;
+            // Le bouton principal garde le focus : Entrée fait toujours « Suivant / Installer / Terminer ».
+            if (btnNext.Enabled) ActiveControl = btnNext;
         }
 
         void Next()
