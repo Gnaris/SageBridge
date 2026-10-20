@@ -1,5 +1,11 @@
 # Historique des versions
 
+## 1.2.1 — 20/10/2026
+
+- Fenêtre : distingue « à jour » de « aucune version publiée » ; `/ping` indique la dernière version publiée, l'état des mises à jour automatiques et si le programme est la copie installée.
+- Publication : récupération fiable du compte GitHub enregistré, envoi du code par l'API, nouvel essai automatique des envois interrompus, reprise d'une publication inachevée.
+- Première version livrée par la mise à jour automatique (test de bout en bout de la 1.2.0).
+
 ## 1.2.0 — 20/10/2026
 
 Première version distribuée avec un installateur.
