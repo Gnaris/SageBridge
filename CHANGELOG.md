@@ -1,5 +1,9 @@
 # Historique des versions
 
+## 1.2.3 — 20/10/2026
+
+- Le champ **Référence** de la facture reste vide : la référence envoyée avec la commande (ex. « Faire 1234ABCD ») n'est plus écrite. Option pour la réactiver dans Réglages (« Écrire la référence de la commande… »).
+
 ## 1.2.2 — 20/10/2026
 
 - **Correction importante** : en quittant (ou pendant une mise à jour), SageBridge relâchait le dossier Sage ouvert par COM, ce qui pouvait figer Sage 50. Il s'arrête désormais sans toucher à la connexion COM, immédiatement (l'installateur de mise à jour n'attend plus).
