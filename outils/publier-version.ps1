@@ -13,6 +13,16 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::Expect100Continue = $false
+function Remove-UntaggedTags {
+    # Étiquettes « untagged-… » laissées par GitHub quand une version est publiée sans étiquette.
+    foreach ($t in @(Api 'GET' "https://api.github.com/repos/$Repo/tags?per_page=100")) {
+        if ($t.name -like 'untagged-*') {
+            Api 'DELETE' "https://api.github.com/repos/$Repo/git/refs/tags/$($t.name)" | Out-Null
+            Write-Host "   Étiquette parasite $($t.name) supprimée."
+        }
+    }
+}
+
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 # Sans BOM : sinon .NET écrit l'en-tête UTF-8 au début de l'entrée de git (« missing protocol field »).
 try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
@@ -107,10 +117,21 @@ try {
         Write-Host '   Dépôt public créé.'
     }
 
+    # Version déjà publiée mais sans étiquette (publication interrompue) : on pose l'étiquette et on s'arrête.
+    $orphan = @(Api 'GET' "https://api.github.com/repos/$Repo/releases?per_page=50") | Where-Object { -not $_.draft -and $_.name -eq "SageBridge $ver" -and $_.tag_name -ne $tag } | Select-Object -First 1
+    if ($orphan) {
+        Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($orphan.id)" @{ tag_name = $tag; target_commitish = 'main'; make_latest = 'true' } | Out-Null
+        Write-Host "   Étiquette $tag posée sur la version déjà publiée."
+        Remove-UntaggedTags
+        Write-Host "✔ SageBridge $ver publié : https://github.com/$Repo/releases/tag/$tag" -ForegroundColor Green
+        Write-Host 'PUBLICATION OK'
+        return
+    }
+
     $already = $true
     try { Api 'GET' "https://api.github.com/repos/$Repo/releases/tags/$tag" | Out-Null }
     catch { if ((StatusOf $_) -eq 404) { $already = $false } else { throw } }
-    if ($already) { throw "La version $ver est déjà publiée. Augmentez AssemblyVersion dans SageBridge.cs, ajoutez la section « ## $ver » au CHANGELOG.md, relancez build.cmd puis ce script." }
+    if ($already) { Remove-UntaggedTags; throw "La version $ver est déjà publiée. Augmentez AssemblyVersion dans SageBridge.cs, ajoutez la section « ## $ver » au CHANGELOG.md, relancez build.cmd puis ce script." }
 
     Step 'Envoi du code source (API GitHub, branche principale)'
     # Envoi fichier par fichier par l'API REST (plus fiable qu'un git push sur certaines connexions).
@@ -152,10 +173,10 @@ try {
     $rel = @(Api 'GET' "https://api.github.com/repos/$Repo/releases?per_page=50") | Where-Object { $_.draft -and $_.tag_name -eq $tag } | Select-Object -First 1
     if ($rel) {
         Write-Host "   Reprise du brouillon existant."
-        Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ name = "SageBridge $ver"; body = $notes } | Out-Null
+        Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ tag_name = $tag; target_commitish = 'main'; name = "SageBridge $ver"; body = $notes } | Out-Null
     } else {
         $rel = Api 'POST' "https://api.github.com/repos/$Repo/releases" @{
-            tag_name = $tag; name = "SageBridge $ver"; body = $notes; draft = $true; prerelease = $false
+            tag_name = $tag; target_commitish = 'main'; name = "SageBridge $ver"; body = $notes; draft = $true; prerelease = $false
         }
     }
     $upload = $rel.upload_url -replace '\{.*\}$', ''
@@ -186,8 +207,9 @@ try {
         }
         if (-not $ok) { throw "Impossible d'envoyer $($a[1]) : relancez publier-version.cmd (le brouillon sera repris)." }
     }
-    Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ draft = $false; make_latest = 'true' } | Out-Null
+    Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ tag_name = $tag; target_commitish = 'main'; draft = $false; make_latest = 'true' } | Out-Null
 
+    Remove-UntaggedTags
     Write-Host ''
     Write-Host "✔ SageBridge $ver publié : https://github.com/$Repo/releases/tag/$tag" -ForegroundColor Green
     Write-Host 'PUBLICATION OK'
