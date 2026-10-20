@@ -128,7 +128,13 @@ try {
         if ($script:GitCode -ne 0) { Invoke-Git commit -q -m "SageBridge $ver" }
         Invoke-Git remote get-url origin
         if ($script:GitCode -ne 0) { Invoke-Git remote add origin "https://github.com/$Repo.git" }
-        Invoke-Git push -u origin main
+        Invoke-Git config http.postBuffer 524288000
+        for ($try = 1; $try -le 3; $try++) {
+            Invoke-Git push -u origin main
+            if ($script:GitCode -eq 0) { break }
+            Write-Host "   Nouvel essai d'envoi ($try/3)…"
+            Start-Sleep -Seconds 5
+        }
         if ($script:GitCode -ne 0) { throw 'git push a échoué (voir ci-dessus).' }
     }
     finally { Pop-Location }
