@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.2.1.0")]
-[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyFileVersion("1.2.2.0")]
 
 namespace SageBridge
 {
@@ -663,9 +663,12 @@ namespace SageBridge
             });
         }
 
-        public void Disconnect()
+        // Libère la connexion COM sans jamais bloquer plus de timeoutMs (la libération peut attendre Sage).
+        public void Disconnect(int timeoutMs)
         {
-            try { Run<bool>(delegate { Reset(); return true; }); } catch { }
+            var done = new ManualResetEvent(false);
+            queue.Add(delegate { try { Reset(); } catch { } done.Set(); });
+            done.WaitOne(timeoutMs);
         }
 
         public InvoiceResult Create(InvoiceRequest req)
@@ -1857,7 +1860,7 @@ namespace SageBridge
                 RefreshDossierLabel();
                 LogLine("Réglages enregistrés.");
                 if (portChanged) { server.Stop(); StartServer(); }
-                if (dossierChanged) ThreadPool.QueueUserWorkItem(delegate { sage.Disconnect(); TryConnect(true); });
+                if (dossierChanged) ThreadPool.QueueUserWorkItem(delegate { sage.Disconnect(15000); TryConnect(true); });
             }
         }
 
@@ -2036,10 +2039,13 @@ namespace SageBridge
             try { sageTimer.Stop(); } catch { }
             try { if (updateTimer != null) updateTimer.Stop(); } catch { }
             try { server.Stop(); } catch { }
-            try { sage.Disconnect(); } catch { }
             tray.Visible = false;
             LogLine("SageBridge arrêté.");
             base.OnFormClosing(e);
+            // Ne JAMAIS relâcher explicitement les objets COM de Sage en quittant : libérer le dossier
+            // obtenu par OpenFile peut figer le Sage ouvert par l'utilisateur (constaté le 20/10/2026).
+            // Le processus est arrêté net, comme un « taskkill » (sans effet sur Sage, vérifié depuis la 1.0).
+            try { Process.GetCurrentProcess().Kill(); } catch { Environment.Exit(0); }
         }
     }
 
