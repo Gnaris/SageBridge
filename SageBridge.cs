@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 namespace SageBridge
 {
@@ -1494,7 +1494,7 @@ namespace SageBridge
         Label lblStatus, lblSage, lblDossier, lblUrl, lblVersion;
         int busy, checking;
         volatile bool updating;
-        string failedVersion = "", notifiedVersion = "";
+        string failedVersion = "", notifiedVersion = "", latestVersion = "";
         System.Windows.Forms.Timer updateTimer;
         ListView list;
         TextBox txtLog;
@@ -1572,9 +1572,10 @@ namespace SageBridge
                 {
                     UpdateInfo u = Updater.Latest(repo);
                     string when = DateTime.Now.ToString("HH:mm");
+                    latestVersion = u == null ? "" : u.VersionText;
                     if (u == null || u.Version <= Updater.Current)
                     {
-                        SetVersionText("Version " + Program.Version + " — à jour (vérifié à " + when + ")", Color.DimGray);
+                        SetVersionText("Version " + Program.Version + (u == null ? " — aucune version publiée sur GitHub (vérifié à " : " — à jour (vérifié à ") + when + ")", Color.DimGray);
                         if (manual) Ui(delegate
                         {
                             MessageBox.Show(this, u == null ? "Aucune version n'est encore publiée sur GitHub (" + repo + ")." : "SageBridge " + Program.Version + " est la dernière version.",
@@ -1807,6 +1808,9 @@ namespace SageBridge
             d["sageFenetre"] = title;
             d["dossier"] = cfg.DossierPath;
             d["clientParDefaut"] = cfg.DefaultClient;
+            d["derniereVersionPubliee"] = latestVersion;
+            d["majAuto"] = cfg.AutoUpdate;
+            d["copieInstallee"] = Updater.IsInstalledCopy;
             return d;
         }
 
