@@ -12,6 +12,7 @@
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::Expect100Continue = $false
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 # Sans BOM : sinon .NET écrit l'en-tête UTF-8 au début de l'entrée de git (« missing protocol field »).
 try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
@@ -34,7 +35,9 @@ function Invoke-Git {
 function Api($Method, $Uri, $Body) {
     $p = @{ Method = $Method; Uri = $Uri; Headers = $script:H }
     if ($Body) { $p.Body = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 5)); $p.ContentType = 'application/json; charset=utf-8' }
-    Invoke-RestMethod @p
+    # « return » énumère les tableaux JSON (Invoke-RestMethod de PowerShell 5 ne le fait pas).
+    $r = Invoke-RestMethod @p
+    return $r
 }
 
 function StatusOf($err) {
@@ -109,35 +112,32 @@ try {
     catch { if ((StatusOf $_) -eq 404) { $already = $false } else { throw } }
     if ($already) { throw "La version $ver est déjà publiée. Augmentez AssemblyVersion dans SageBridge.cs, ajoutez la section « ## $ver » au CHANGELOG.md, relancez build.cmd puis ce script." }
 
-    Step 'Envoi du code source (branche main)'
-    Push-Location $Root
-    try {
-        if (-not (Test-Path (Join-Path $Root '.git'))) {
-            Invoke-Git init -q
-            Invoke-Git symbolic-ref HEAD refs/heads/main
-        }
-        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $uname = & $script:Git config user.name 2>$null
-        $ErrorActionPreference = $old
-        if (-not $uname) {
-            Invoke-Git config user.name $me.login
-            Invoke-Git config user.email "$($me.id)+$($me.login)@users.noreply.github.com"
-        }
-        Invoke-Git add -A
-        Invoke-Git diff --cached --quiet
-        if ($script:GitCode -ne 0) { Invoke-Git commit -q -m "SageBridge $ver" }
-        Invoke-Git remote get-url origin
-        if ($script:GitCode -ne 0) { Invoke-Git remote add origin "https://github.com/$Repo.git" }
-        Invoke-Git config http.postBuffer 524288000
-        for ($try = 1; $try -le 3; $try++) {
-            Invoke-Git push -u origin main
-            if ($script:GitCode -eq 0) { break }
-            Write-Host "   Nouvel essai d'envoi ($try/3)…"
-            Start-Sleep -Seconds 5
-        }
-        if ($script:GitCode -ne 0) { throw 'git push a échoué (voir ci-dessus).' }
+    Step 'Envoi du code source (API GitHub, branche principale)'
+    # Envoi fichier par fichier par l'API REST (plus fiable qu'un git push sur certaines connexions).
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    $files = Get-ChildItem -Path $Root -Recurse -File -Force | Where-Object {
+        $_.FullName -notmatch '\\(bin|obj|\.git|\.vs)\\' -and $_.Extension -ne '.log'
     }
-    finally { Pop-Location }
+    $sent = 0
+    foreach ($f in $files) {
+        $rel = $f.FullName.Substring($Root.Length + 1).Replace('\', '/')
+        $bytes = [IO.File]::ReadAllBytes($f.FullName)
+        # Empreinte « blob » de Git : permet de ne renvoyer que les fichiers modifiés.
+        $head = [Text.Encoding]::ASCII.GetBytes("blob $($bytes.Length)`0")
+        $blob = New-Object byte[] ($head.Length + $bytes.Length)
+        [Array]::Copy($head, $blob, $head.Length); [Array]::Copy($bytes, 0, $blob, $head.Length, $bytes.Length)
+        $local = -join ($sha1.ComputeHash($blob) | ForEach-Object { $_.ToString('x2') })
+        $url = "https://api.github.com/repos/$Repo/contents/" + [Uri]::EscapeUriString($rel)
+        $remote = $null
+        try { $remote = (Api 'GET' $url).sha } catch { if ((StatusOf $_) -ne 404) { throw } }
+        if ($remote -eq $local) { continue }
+        $body = @{ message = "SageBridge $ver — $rel"; content = [Convert]::ToBase64String($bytes) }
+        if ($remote) { $body.sha = $remote }
+        Api 'PUT' $url $body | Out-Null
+        Write-Host "   $rel"
+        $sent++
+    }
+    Write-Host "   $sent fichier(s) envoyé(s)."
 
     Step "Release $tag"
     $notes = "SageBridge $ver"
@@ -148,15 +148,43 @@ try {
         if ($m.Success) { $notes = $m.Groups[1].Value.Trim() }
     }
     $notes += "`n`n---`n**Installation** : téléchargez ``SageBridge-Setup.exe`` ci-dessous et lancez-le (Windows peut afficher « Windows a protégé votre ordinateur » : *Informations complémentaires* → *Exécuter quand même*). Les SageBridge déjà installés se mettent à jour tout seuls."
-    $rel = Api 'POST' "https://api.github.com/repos/$Repo/releases" @{
-        tag_name = $tag; target_commitish = 'main'; name = "SageBridge $ver"; body = $notes; draft = $true; prerelease = $false
+    # Reprend un brouillon laissé par une publication interrompue, sinon en crée un.
+    $rel = @(Api 'GET' "https://api.github.com/repos/$Repo/releases?per_page=50") | Where-Object { $_.draft -and $_.tag_name -eq $tag } | Select-Object -First 1
+    if ($rel) {
+        Write-Host "   Reprise du brouillon existant."
+        Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ name = "SageBridge $ver"; body = $notes } | Out-Null
+    } else {
+        $rel = Api 'POST' "https://api.github.com/repos/$Repo/releases" @{
+            tag_name = $tag; name = "SageBridge $ver"; body = $notes; draft = $true; prerelease = $false
+        }
     }
     $upload = $rel.upload_url -replace '\{.*\}$', ''
     $assets = @(@($setup, 'SageBridge-Setup.exe'), @($sha, 'SageBridge-Setup.exe.sha256'))
     if (Test-Path $pdf) { $assets += , @($pdf, 'SageBridge-Documentation.pdf') }
+    $existing = @(Api 'GET' "https://api.github.com/repos/$Repo/releases/$($rel.id)/assets")
     foreach ($a in $assets) {
-        Write-Host "   Envoi de $($a[1])…"
-        Invoke-RestMethod -Method Post -Uri ("${upload}?name=" + [Uri]::EscapeDataString($a[1])) -Headers $script:H -ContentType 'application/octet-stream' -InFile $a[0] | Out-Null
+        foreach ($old in ($existing | Where-Object { $_.name -eq $a[1] })) {
+            Api 'DELETE' "https://api.github.com/repos/$Repo/releases/assets/$($old.id)" | Out-Null
+        }
+        $size = [Math]::Round((Get-Item $a[0]).Length / 1KB)
+        for ($try = 1; $try -le 4; $try++) {
+            Write-Host "   Envoi de $($a[1]) ($size Ko)… essai $try"
+            try {
+                Invoke-RestMethod -Method Post -Uri ("${upload}?name=" + [Uri]::EscapeDataString($a[1])) -Headers $script:H `
+                    -ContentType 'application/octet-stream' -InFile $a[0] -TimeoutSec 600 | Out-Null
+                $ok = $true; break
+            }
+            catch {
+                $ok = $false
+                Write-Host "   échec : $($_.Exception.Message)"
+                # Un envoi interrompu peut laisser un fichier incomplet : on le supprime avant de réessayer.
+                foreach ($bad in (@(Api 'GET' "https://api.github.com/repos/$Repo/releases/$($rel.id)/assets") | Where-Object { $_.name -eq $a[1] })) {
+                    Api 'DELETE' "https://api.github.com/repos/$Repo/releases/assets/$($bad.id)" | Out-Null
+                }
+                Start-Sleep -Seconds 5
+            }
+        }
+        if (-not $ok) { throw "Impossible d'envoyer $($a[1]) : relancez publier-version.cmd (le brouillon sera repris)." }
     }
     Api 'PATCH' "https://api.github.com/repos/$Repo/releases/$($rel.id)" @{ draft = $false; make_latest = 'true' } | Out-Null
 
