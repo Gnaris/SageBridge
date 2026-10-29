@@ -1,5 +1,11 @@
 # Historique des versions
 
+## 1.3.4 — 29/10/2026
+
+- **Dossiers en mode Données Mobiles (ou ouverts par un serveur Sage)** : on peut désormais coller dans Réglages > Dossier Sage 50 le « Chemin d'accès » affiché par Sage (Dossier > Options > Informations), qui commence par `!Srv!` (ex. `!Srv!<Smart>/S:/Données Ciel/Dossiers/…/X.SgWgc`). SageBridge le transmet tel quel à Sage au lieu de le refuser comme fichier introuvable.
+- La recherche automatique des dossiers ignore les anciennes copies `…_OLD.SgWgc` laissées par Sage lors d'une conversion (Sage refuse de les ouvrir : « Il est impossible d'ouvrir une base locale »).
+- Message d'erreur plus juste quand Sage refuse d'ouvrir le dossier : copie `_OLD`, dossier servi par Sage (Données Mobiles) ou cas général. Avant, tout refus accusait l'autorisation d'accès COM, même quand elle était active.
+
 ## 1.3.3 — 29/10/2026
 
 - `/articles` retente automatiquement une fois si Sage s'est reconnecté entre-temps (« Le serveur RPC n'est pas disponible »). Même garde-fou que la création de factures depuis la 1.1.0.
