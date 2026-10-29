@@ -1,5 +1,9 @@
 # Historique des versions
 
+## 1.3.3 — 29/10/2026
+
+- `/articles` retente automatiquement une fois si Sage s'est reconnecté entre-temps (« Le serveur RPC n'est pas disponible »). Même garde-fou que la création de factures depuis la 1.1.0.
+
 ## 1.3.2 — 29/10/2026
 
 - L'admin de la boutique (`beliandjolie.com`, `issyma.fr`) peut désormais interroger SageBridge pour afficher la liste des articles Sage dans le mapping « Code article Sage » d'une catégorie. Pas d'exposition supplémentaire : chaque admin tourne dans le navigateur de son propriétaire, SageBridge reste accessible uniquement en local sur `127.0.0.1`.
