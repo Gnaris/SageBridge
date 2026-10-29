@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyVersion("1.3.1.0")]
+[assembly: AssemblyFileVersion("1.3.1.0")]
 
 namespace SageBridge
 {
@@ -454,10 +454,10 @@ namespace SageBridge
         // Tables (enum eTableIds) : OpenTable attend la valeur sur 24 bits (valeur & 0xFFFFFF).
         // kWgcTableIdCli = 0x8C017AEB → 0x017AEB = 97003. La valeur brute ouvre une autre table.
         public const int TBL_CLIENTS = 0x017AEB;
-        // Table articles : l'enum WGC.tlb mentionne kWgcTableIdArticleWW mais la
-        // valeur n'a pas été vérifiée live. ResolveArticleTableId() scanne un
-        // intervalle autour de TBL_CLIENTS et retient l'id dont TableName == "Art".
-        // Résultat mis en cache après la 1ʳᵉ résolution.
+        // Table articles : TableName vérifié live le 29/10/2026 sur Sage 50 v6.71.
+        // L'id est caché derrière la bonne valeur ; la constante reste le secret
+        // de bas niveau, ResolveArticleTableId() valide à l'ouverture.
+        public const int TBL_ARTICLES = 97002;
 
         // Rubriques de la table clients : résolues par leur nom à l'ouverture (ITable.Fields),
         // avec ces valeurs de secours (enum eWgcTableCliFieldIds & 0xFFFFFF, vérifiées sur Sage 50 v6.71).
@@ -775,32 +775,30 @@ namespace SageBridge
             });
         }
 
-        // Cache (dans le worker, 1 seule résolution par session) de l'id de la
-        // table articles — 0 tant que non résolu, -1 si introuvable.
+        // Cache (par instance de worker) de l'id de la table articles — 0 tant
+        // que non vérifié, >0 une fois ouvert avec succès et TableName confirmé.
+        // Pas de valeur négative mise en cache : si la validation échoue sur
+        // l'instance courante, chaque appel retentera la validation (c'est léger
+        // tant que ça marche la 1ʳᵉ fois).
         int tblArticlesCache = 0;
 
         int ResolveArticleTableId()
         {
-            if (tblArticlesCache != 0) return tblArticlesCache;
-            // 97003 = Cli ; les tables Sage sont généralement rapprochées. On
-            // essaie en priorité la valeur candidate 97005, puis on scanne les
-            // voisines jusqu'à trouver TableName == "Art".
-            int[] candidates = new int[] { 97005, 97004, 97006, 97007, 97008, 97009, 97010, 97011, 97012, 97002, 97001, 97000 };
-            foreach (int cand in candidates)
+            if (tblArticlesCache > 0) return tblArticlesCache;
+            dynamic t = null;
+            try
             {
-                dynamic t = null;
-                try
+                t = doc.OpenTable(TBL_ARTICLES);
+                string name = null;
+                try { name = (string)t.TableName; } catch { }
+                if (name == "Article")
                 {
-                    t = doc.OpenTable(cand);
-                    string name = null;
-                    try { name = (string)t.TableName; } catch { }
-                    if (name == "Art") { tblArticlesCache = cand; return cand; }
+                    tblArticlesCache = TBL_ARTICLES;
+                    return TBL_ARTICLES;
                 }
-                catch { }
-                finally { if (t != null) { try { Marshal.FinalReleaseComObject(t); } catch { } } }
+                throw new InvalidOperationException("Table articles : nom inattendu « " + name + " » (attendu « Article »).");
             }
-            tblArticlesCache = -1;
-            throw new InvalidOperationException("Table « Art » introuvable (scanné 97000→97012). Utilise /diag pour la trouver manuellement.");
+            finally { if (t != null) { try { Marshal.FinalReleaseComObject(t); } catch { } } }
         }
 
         // Liste les articles du dossier (code + nom court). Résout les rubriques
