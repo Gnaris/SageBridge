@@ -1,5 +1,9 @@
 # Historique des versions
 
+## 1.3.2 — 29/10/2026
+
+- L'admin de la boutique (`beliandjolie.com`, `issyma.fr`) peut désormais interroger SageBridge pour afficher la liste des articles Sage dans le mapping « Code article Sage » d'une catégorie. Pas d'exposition supplémentaire : chaque admin tourne dans le navigateur de son propriétaire, SageBridge reste accessible uniquement en local sur `127.0.0.1`.
+
 ## 1.3.1 — 29/10/2026
 
 - **Correction** : la route `/articles` échouait sur toutes les installations (« Table Art introuvable »). L'id de la table est maintenant la bonne valeur vérifiée live sur Sage 50 v6.71 (97002, nom interne « Article »).
