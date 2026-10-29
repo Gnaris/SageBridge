@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.1.0")]
-[assembly: AssemblyFileVersion("1.3.1.0")]
+[assembly: AssemblyVersion("1.3.2.0")]
+[assembly: AssemblyFileVersion("1.3.2.0")]
 
 namespace SageBridge
 {
@@ -1423,14 +1423,26 @@ namespace SageBridge
         // Sécurité : seuls les extensions de navigateur, les pages de SageBridge lui-même et les outils
         // locaux (PowerShell, scripts : pas d'en-tête Origin) sont acceptés. Une page web quelconque
         // ouverte dans le navigateur ne peut ni créer de facture ni lire la liste des clients.
+        // Les admins des boutiques tenant (BJ, Issyma) doivent pouvoir lire
+        // /articles pour peupler le dropdown « Code article Sage » quand on
+        // mappe une catégorie. Chaque admin tourne dans le navigateur de son
+        // propriétaire, donc 127.0.0.1 reste local.
+        static readonly string[] AllowedShopOrigins = new[] {
+            "https://beliandjolie.com", "https://www.beliandjolie.com",
+            "https://issyma.fr",        "https://www.issyma.fr",
+            "http://localhost:3000"
+        };
+
         bool OriginAllowed(HttpListenerRequest r, out string origin)
         {
             origin = r.Headers["Origin"];
             if (!string.IsNullOrEmpty(origin))
             {
                 string o = origin.Trim().ToLowerInvariant();
-                return o.StartsWith("chrome-extension://") || o.StartsWith("moz-extension://") || o.StartsWith("safari-web-extension://")
-                    || o == "http://127.0.0.1:" + port || o == "http://localhost:" + port;
+                if (o.StartsWith("chrome-extension://") || o.StartsWith("moz-extension://") || o.StartsWith("safari-web-extension://")
+                    || o == "http://127.0.0.1:" + port || o == "http://localhost:" + port) return true;
+                foreach (string allowed in AllowedShopOrigins) if (o == allowed) return true;
+                return false;
             }
             string site = (r.Headers["Sec-Fetch-Site"] ?? "").ToLowerInvariant();
             return !(site == "cross-site" || site == "same-site");
