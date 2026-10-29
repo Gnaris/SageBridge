@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.2.3.0")]
-[assembly: AssemblyFileVersion("1.2.3.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 namespace SageBridge
 {
@@ -454,6 +454,10 @@ namespace SageBridge
         // Tables (enum eTableIds) : OpenTable attend la valeur sur 24 bits (valeur & 0xFFFFFF).
         // kWgcTableIdCli = 0x8C017AEB → 0x017AEB = 97003. La valeur brute ouvre une autre table.
         public const int TBL_CLIENTS = 0x017AEB;
+        // Table articles : l'enum WGC.tlb mentionne kWgcTableIdArticleWW mais la
+        // valeur n'a pas été vérifiée live. ResolveArticleTableId() scanne un
+        // intervalle autour de TBL_CLIENTS et retient l'id dont TableName == "Art".
+        // Résultat mis en cache après la 1ʳᵉ résolution.
 
         // Rubriques de la table clients : résolues par leur nom à l'ouverture (ITable.Fields),
         // avec ces valeurs de secours (enum eWgcTableCliFieldIds & 0xFFFFFF, vérifiées sur Sage 50 v6.71).
@@ -767,6 +771,94 @@ namespace SageBridge
                     d["modeTVA"] = r.ModeTVA; d["tva"] = r.Nii; d["prospect"] = r.Prospect;
                     outp.Add(d);
                 }
+                return outp;
+            });
+        }
+
+        // Cache (dans le worker, 1 seule résolution par session) de l'id de la
+        // table articles — 0 tant que non résolu, -1 si introuvable.
+        int tblArticlesCache = 0;
+
+        int ResolveArticleTableId()
+        {
+            if (tblArticlesCache != 0) return tblArticlesCache;
+            // 97003 = Cli ; les tables Sage sont généralement rapprochées. On
+            // essaie en priorité la valeur candidate 97005, puis on scanne les
+            // voisines jusqu'à trouver TableName == "Art".
+            int[] candidates = new int[] { 97005, 97004, 97006, 97007, 97008, 97009, 97010, 97011, 97012, 97002, 97001, 97000 };
+            foreach (int cand in candidates)
+            {
+                dynamic t = null;
+                try
+                {
+                    t = doc.OpenTable(cand);
+                    string name = null;
+                    try { name = (string)t.TableName; } catch { }
+                    if (name == "Art") { tblArticlesCache = cand; return cand; }
+                }
+                catch { }
+                finally { if (t != null) { try { Marshal.FinalReleaseComObject(t); } catch { } } }
+            }
+            tblArticlesCache = -1;
+            throw new InvalidOperationException("Table « Art » introuvable (scanné 97000→97012). Utilise /diag pour la trouver manuellement.");
+        }
+
+        // Liste les articles du dossier (code + nom court). Résout les rubriques
+        // par nom (ITable.Fields) avec un repli sur les valeurs par défaut
+        // observées sur Sage 50 v6.71.
+        public List<Dictionary<string, object>> ListArticles()
+        {
+            return Run<List<Dictionary<string, object>>>(delegate
+            {
+                EnsureOpen();
+                int tableId = ResolveArticleTableId();
+                var outp = new List<Dictionary<string, object>>();
+                dynamic t = doc.OpenTable(tableId);
+                try
+                {
+                    int fidCode = 1, fidName = 2;
+                    try
+                    {
+                        dynamic coll = t.Fields;
+                        int n = (int)coll.Count;
+                        for (int i = 1; i <= n; i++)
+                        {
+                            dynamic f = null;
+                            try { f = coll.Item(i); } catch { continue; }
+                            string nm = null;
+                            try { nm = (string)f.Name; } catch { }
+                            int id = 0;
+                            try { id = (int)f.Id; } catch { }
+                            if (nm == "Code") fidCode = id;
+                            else if (nm == "DescShort" || nm == "Description" || nm == "Nom" || nm == "Intitule") fidName = id;
+                        }
+                    }
+                    catch { }
+                    bool more = false;
+                    try { more = (bool)t.First(); } catch { }
+                    int safety = 50000;
+                    while (more && safety-- > 0)
+                    {
+                        try
+                        {
+                            object oCode = t.GetVal(fidCode);
+                            string code = oCode == null ? "" : Convert.ToString(oCode, CultureInfo.InvariantCulture);
+                            if (!string.IsNullOrEmpty(code))
+                            {
+                                object oNom = null;
+                                try { oNom = t.GetVal(fidName); } catch { }
+                                string nom = oNom == null ? "" : Convert.ToString(oNom, CultureInfo.InvariantCulture);
+                                var d = new Dictionary<string, object>();
+                                d["code"] = code;
+                                d["nom"] = nom;
+                                outp.Add(d);
+                            }
+                        }
+                        catch { }
+                        try { more = (bool)t.Next(); } catch { break; }
+                    }
+                }
+                finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
                 return outp;
             });
         }
@@ -1299,6 +1391,7 @@ namespace SageBridge
         public Func<Dictionary<string, object>> OnStatus;
         public Func<int, int[], Dictionary<string, object>> OnDiag;
         public Func<List<Dictionary<string, object>>> OnClients;
+        public Func<List<Dictionary<string, object>>> OnArticles;
         HttpListener listener;
         int port;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -1379,6 +1472,10 @@ namespace SageBridge
                 if (path == "/clients" && method == "GET")
                 {
                     Send(resp, 200, json.Serialize(OnClients())); return;
+                }
+                if (path == "/articles" && method == "GET")
+                {
+                    Send(resp, 200, json.Serialize(OnArticles())); return;
                 }
                 if (path == "/diag" && method == "GET")
                 {
@@ -1526,6 +1623,7 @@ namespace SageBridge
             server.OnStatus = StatusDict;
             server.OnDiag = delegate(int id, int[] fids) { return sage.Diag(id, fids); };
             server.OnClients = delegate { return sage.ListClients(); };
+            server.OnArticles = delegate { return sage.ListArticles(); };
             StartServer();
 
             showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
