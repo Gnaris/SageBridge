@@ -1,5 +1,10 @@
 # Historique des versions
 
+## 1.3.0 — 29/10/2026
+
+- Nouvelle route **`GET /articles`** : liste tous les articles du dossier Sage (code + nom court). L'extension s'en sert pour peupler le choix d'article à la volée quand un produit n'a pas de code renseigné côté boutique — plus besoin de connaître les codes par cœur.
+- L'identifiant de la table articles est **résolu automatiquement** (scanne 97000→97012 et retient celle dont le nom interne est « Art ») : marche sur tous les dossiers Sage sans config manuelle.
+
 ## 1.2.3 — 20/10/2026
 
 - Le champ **Référence** de la facture reste vide : la référence envoyée avec la commande (ex. « Faire 1234ABCD ») n'est plus écrite. Option pour la réactiver dans Réglages (« Écrire la référence de la commande… »).
