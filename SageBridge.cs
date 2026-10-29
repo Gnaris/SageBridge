@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.3.0")]
-[assembly: AssemblyFileVersion("1.3.3.0")]
+[assembly: AssemblyVersion("1.3.4.0")]
+[assembly: AssemblyFileVersion("1.3.4.0")]
 
 namespace SageBridge
 {
@@ -173,10 +173,44 @@ namespace SageBridge
 
         public string DossierName
         {
-            get { return string.IsNullOrEmpty(DossierPath) ? "" : Path.GetFileNameWithoutExtension(DossierPath); }
+            get { return DossierLabel(DossierPath); }
         }
 
-        // Dossiers Sage 50 Gestion commerciale (*.SgWgc), hors points de restauration et modèles.
+        // Dossier ouvert par le serveur de Sage (mode Données Mobiles ou réseau) : chemin tel qu'affiché dans
+        // Dossier > Options > Informations > Chemin d'accès, ex. « !Srv!<Smart>/S:/Données Ciel/Dossiers/X/Ciel Gestion Commerciale/X.SgWgc ».
+        public static bool IsServerPath(string p)
+        {
+            return !string.IsNullOrEmpty(p) && p.TrimStart().StartsWith("!Srv!", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Un chemin serveur ne peut pas être vérifié sur le disque : c'est Sage qui tranche à l'ouverture.
+        public static bool DossierExists(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return false;
+            if (IsServerPath(p)) return true;
+            try { return File.Exists(p); } catch { return false; }
+        }
+
+        // Nom du dossier sans extension, sans passer par Path (qui refuse les « < » « > » des chemins serveur).
+        public static string DossierLabel(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return "";
+            string s = p.Trim();
+            int cut = Math.Max(s.LastIndexOf('/'), s.LastIndexOf('\\'));
+            if (cut >= 0) s = s.Substring(cut + 1);
+            int dot = s.LastIndexOf('.');
+            if (dot > 0) s = s.Substring(0, dot);
+            return s;
+        }
+
+        // Ancienne copie laissée par Sage lors d'une conversion (ex. passage en Données Mobiles) : « X_OLD.SgWgc ».
+        // Sage refuse de l'ouvrir (« Il est impossible d'ouvrir une base locale »).
+        public static bool IsOldCopy(string p)
+        {
+            return DossierLabel(p).EndsWith("_OLD", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Dossiers Sage 50 Gestion commerciale (*.SgWgc), hors points de restauration, modèles et anciennes copies « _OLD ».
         public static List<string> FindDossiers()
         {
             var roots = new List<string>();
@@ -196,6 +230,7 @@ namespace SageBridge
                     {
                         string low = f.ToLowerInvariant();
                         if (low.Contains("restorepoints") || low.Contains("\\statics\\") || low.Contains("compléments") || low.Contains("complements")) continue;
+                        if (IsOldCopy(f)) continue;
                         if (!found.Contains(f)) found.Add(f);
                     }
                 }
@@ -611,7 +646,7 @@ namespace SageBridge
         void EnsureOpen()
         {
             if (doc != null) return;
-            if (string.IsNullOrEmpty(cfg.DossierPath) || !File.Exists(cfg.DossierPath))
+            if (!Settings.DossierExists(cfg.DossierPath))
                 throw new Exception("Dossier Sage introuvable : « " + cfg.DossierPath + " ». Choisissez-le dans Réglages.");
             Type t = Type.GetTypeFromProgID("CielGestionCommerciale.Application");
             if (t == null) throw new Exception("Sage 50 Gestion commerciale n'est pas installé sur ce PC (objet COM CielGestionCommerciale.Application absent).");
@@ -620,15 +655,28 @@ namespace SageBridge
             string version = "?";
             try { version = (string)app.Name(0); } catch { }
             Log("Connexion à " + version);
-            try { doc = app.OpenFile(cfg.DossierPath, "", "", 0); }
+            try { doc = app.OpenFile(cfg.DossierPath.Trim(), "", "", 0); }
             catch (Exception e)
             {
                 Reset();
-                throw new Exception("Sage a refusé d'ouvrir le dossier (" + ComMessage(e) + "). Vérifiez l'autorisation d'accès COM dans Sage : menu Utilitaires > Mode avancé > Divers > Autorisation accès COM.");
+                throw new Exception(OpenFailureMessage(cfg.DossierPath, ComMessage(e)));
             }
             if (doc == null) { Reset(); throw new Exception("Sage a refusé d'ouvrir le dossier " + cfg.DossierPath); }
             Log("Dossier ouvert : " + (string)doc.Name);
             LoadClientFields();
+        }
+
+        // Explication adaptée au refus d'ouverture (avant 1.3.4, tout refus accusait à tort l'accès COM).
+        static string OpenFailureMessage(string path, string sageMsg)
+        {
+            string head = "Sage a refusé d'ouvrir le dossier (" + sageMsg + "). ";
+            string where = "Dans Sage : Dossier > Options > Informations, relevez le « Chemin d'accès » du dossier ouvert";
+            string low = (sageMsg ?? "").ToLowerInvariant();
+            if (Settings.IsOldCopy(path))
+                return head + "Ce fichier « _OLD » est une ancienne copie laissée par Sage, pas le dossier en service. " + where + " et indiquez-le dans Réglages.";
+            if (low.Contains("base locale") && !Settings.IsServerPath(path))
+                return head + "Ce dossier est ouvert dans Sage par son serveur (mode Données Mobiles ou réseau). " + where + " (il commence par !Srv!) et collez-le tel quel dans Réglages > Dossier Sage 50.";
+            return head + "Vérifiez que c'est bien le dossier ouvert dans Sage (" + where + ") et que l'autorisation d'accès COM est active (Utilitaires > Mode avancé > Divers > Autorisation accès COM).";
         }
 
         void LoadClientFields()
@@ -1946,7 +1994,7 @@ namespace SageBridge
 
         void EnsureDossier()
         {
-            if (!string.IsNullOrEmpty(cfg.DossierPath) && File.Exists(cfg.DossierPath)) return;
+            if (Settings.DossierExists(cfg.DossierPath)) return;
             List<string> found = Settings.FindDossiers();
             string chosen = null;
             if (found.Count == 1) chosen = found[0];
@@ -2289,6 +2337,8 @@ namespace SageBridge
             g.SetColumnSpan(g.GetControlFromPosition(0, 5), 3);
             g.Controls.Add(new Label { Text = "Fichiers de SageBridge (réglages, historique, journal) : " + Settings.Dir, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 0, 6);
             g.SetColumnSpan(g.GetControlFromPosition(0, 6), 3);
+            g.Controls.Add(new Label { Text = "Dossier en mode Données Mobiles ou sur un serveur : collez dans « Dossier Sage 50 » le chemin d'accès affiché par Sage\n(Dossier > Options > Informations), qui commence par !Srv!. Les fichiers « _OLD » sont d'anciennes copies : ne pas les choisir.", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 0, 7);
+            g.SetColumnSpan(g.GetControlFromPosition(0, 7), 3);
             Controls.Add(g);
             Controls.Add(Ui2.OkCancel(this, "Enregistrer"));
         }
