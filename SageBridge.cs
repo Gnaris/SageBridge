@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.2.0")]
-[assembly: AssemblyFileVersion("1.3.2.0")]
+[assembly: AssemblyVersion("1.3.3.0")]
+[assembly: AssemblyFileVersion("1.3.3.0")]
 
 namespace SageBridge
 {
@@ -803,62 +803,75 @@ namespace SageBridge
 
         // Liste les articles du dossier (code + nom court). Résout les rubriques
         // par nom (ITable.Fields) avec un repli sur les valeurs par défaut
-        // observées sur Sage 50 v6.71.
+        // observées sur Sage 50 v6.71. Mêmes garde-fous que `Create` : si Sage
+        // a été redémarré entre-temps (RPC indisponible, HRESULT 0x800706BA),
+        // on relâche la connexion et on retente une fois.
         public List<Dictionary<string, object>> ListArticles()
         {
             return Run<List<Dictionary<string, object>>>(delegate
             {
-                EnsureOpen();
-                int tableId = ResolveArticleTableId();
-                var outp = new List<Dictionary<string, object>>();
-                dynamic t = doc.OpenTable(tableId);
+                try { return ListArticlesInner(); }
+                catch (Exception first)
+                {
+                    Log("Échec (" + ComMessage(first) + "), nouvelle tentative après reconnexion…");
+                    Reset();
+                    return ListArticlesInner();
+                }
+            });
+        }
+
+        List<Dictionary<string, object>> ListArticlesInner()
+        {
+            EnsureOpen();
+            int tableId = ResolveArticleTableId();
+            var outp = new List<Dictionary<string, object>>();
+            dynamic t = doc.OpenTable(tableId);
+            try
+            {
+                int fidCode = 1, fidName = 2;
                 try
                 {
-                    int fidCode = 1, fidName = 2;
+                    dynamic coll = t.Fields;
+                    int n = (int)coll.Count;
+                    for (int i = 1; i <= n; i++)
+                    {
+                        dynamic f = null;
+                        try { f = coll.Item(i); } catch { continue; }
+                        string nm = null;
+                        try { nm = (string)f.Name; } catch { }
+                        int id = 0;
+                        try { id = (int)f.Id; } catch { }
+                        if (nm == "Code") fidCode = id;
+                        else if (nm == "DescShort" || nm == "Description" || nm == "Nom" || nm == "Intitule") fidName = id;
+                    }
+                }
+                catch { }
+                bool more = false;
+                try { more = (bool)t.First(); } catch { }
+                int safety = 50000;
+                while (more && safety-- > 0)
+                {
                     try
                     {
-                        dynamic coll = t.Fields;
-                        int n = (int)coll.Count;
-                        for (int i = 1; i <= n; i++)
+                        object oCode = t.GetVal(fidCode);
+                        string code = oCode == null ? "" : Convert.ToString(oCode, CultureInfo.InvariantCulture);
+                        if (!string.IsNullOrEmpty(code))
                         {
-                            dynamic f = null;
-                            try { f = coll.Item(i); } catch { continue; }
-                            string nm = null;
-                            try { nm = (string)f.Name; } catch { }
-                            int id = 0;
-                            try { id = (int)f.Id; } catch { }
-                            if (nm == "Code") fidCode = id;
-                            else if (nm == "DescShort" || nm == "Description" || nm == "Nom" || nm == "Intitule") fidName = id;
+                            object oNom = null;
+                            try { oNom = t.GetVal(fidName); } catch { }
+                            string nom = oNom == null ? "" : Convert.ToString(oNom, CultureInfo.InvariantCulture);
+                            var d = new Dictionary<string, object>();
+                            d["code"] = code;
+                            d["nom"] = nom;
+                            outp.Add(d);
                         }
                     }
                     catch { }
-                    bool more = false;
-                    try { more = (bool)t.First(); } catch { }
-                    int safety = 50000;
-                    while (more && safety-- > 0)
-                    {
-                        try
-                        {
-                            object oCode = t.GetVal(fidCode);
-                            string code = oCode == null ? "" : Convert.ToString(oCode, CultureInfo.InvariantCulture);
-                            if (!string.IsNullOrEmpty(code))
-                            {
-                                object oNom = null;
-                                try { oNom = t.GetVal(fidName); } catch { }
-                                string nom = oNom == null ? "" : Convert.ToString(oNom, CultureInfo.InvariantCulture);
-                                var d = new Dictionary<string, object>();
-                                d["code"] = code;
-                                d["nom"] = nom;
-                                outp.Add(d);
-                            }
-                        }
-                        catch { }
-                        try { more = (bool)t.Next(); } catch { break; }
-                    }
+                    try { more = (bool)t.Next(); } catch { break; }
                 }
-                finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
-                return outp;
-            });
+            }
+            finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
+            return outp;
         }
 
         // Outil de développement : ouvre une table et liste ses rubriques (GET /diag?id=…&fids=…).
