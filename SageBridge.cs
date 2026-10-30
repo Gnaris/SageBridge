@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.4.0")]
-[assembly: AssemblyFileVersion("1.3.4.0")]
+[assembly: AssemblyVersion("1.3.5.0")]
+[assembly: AssemblyFileVersion("1.3.5.0")]
 
 namespace SageBridge
 {
@@ -510,6 +510,16 @@ namespace SageBridge
         dynamic app, doc;
         Dictionary<string, int> cliFields;
 
+        // Cache clients persistant (voir ReadClients). Clé = nom du dossier + NbN de la table.
+        // En base locale un balayage de la table clients est quasi gratuit, en Données Mobiles
+        // il coûte ~40 s pour 11000 fiches (chaque Next+GetVal est un aller-retour réseau).
+        // Avec le cache, chaque facture économise ce balayage, sauf au premier démarrage sur
+        // un dossier ou après qu'une fiche a été ajoutée/supprimée depuis Sage.
+        List<ClientRow> cachedClients;
+        string cachedClientsDossier;
+        int cachedClientsNbN;
+        const int CLIENTS_CACHE_VERSION = 1;
+
         public SageWorker(Settings settings)
         {
             cfg = settings;
@@ -777,8 +787,53 @@ namespace SageBridge
 
         static string FirstNonEmpty(string a, string b) { return string.IsNullOrEmpty(a) ? b : a; }
 
+        // Point d'entrée : retourne la liste des clients. Essaie dans l'ordre : cache mémoire,
+        // cache fichier, balayage complet de la table. La validité du cache repose sur NbN
+        // (nombre de fiches côté Sage). NbN seul suffit pour détecter un ajout/suppression ;
+        // une modification de fiche existante ne le fait pas bouger — supprimer manuellement
+        // le fichier .cache force alors une reconstruction.
         List<ClientRow> ReadClients()
         {
+            string dossier = "";
+            try { dossier = (string)doc.Name; } catch { }
+
+            int nbN = -1;
+            dynamic probe = doc.OpenTable(TBL_CLIENTS);
+            try { nbN = (int)probe.NbN; }
+            finally { try { Marshal.FinalReleaseComObject(probe); } catch { } }
+
+            if (cachedClients != null && cachedClientsDossier == dossier && cachedClientsNbN == nbN)
+                return cachedClients;
+
+            List<ClientRow> rows = LoadClientsCache(dossier, nbN);
+            if (rows == null) rows = ScanClientsAndSaveCache(dossier, nbN);
+
+            cachedClients = rows;
+            cachedClientsDossier = dossier;
+            cachedClientsNbN = nbN;
+            return rows;
+        }
+
+        ClientRow BuildClientRow(dynamic t)
+        {
+            var r = new ClientRow();
+            r.Code = V(t, "Code");
+            r.NomBrut = V(t, "Nom");
+            r.Nom = Norm.Text(r.NomBrut);
+            r.ModeTVA = V(t, "ModeTVA");
+            r.Nii = V(t, "NII");
+            r.PaysBrut = V(t, "FacCtyName");
+            r.VilleBrut = (V(t, "FacCP") + " " + V(t, "FacVille")).Trim();
+            r.Fac = new string[] { Norm.Text(V(t, "FacSociete")), Norm.Text(V(t, "FacAdresse1")), Norm.Digits(V(t, "FacCP")), Norm.Text(V(t, "FacVille")), Norm.CountryKey(FirstNonEmpty(V(t, "FacCtyCode"), V(t, "FacCtyName"))) };
+            r.Liv = new string[] { Norm.Text(V(t, "LivSociete")), Norm.Text(V(t, "LivAdresse1")), Norm.Digits(V(t, "LivCP")), Norm.Text(V(t, "LivVille")), Norm.CountryKey(FirstNonEmpty(V(t, "LivCtyCode"), V(t, "LivCtyName"))) };
+            string pr = V(t, "IsProspect").ToLowerInvariant();
+            r.Prospect = pr == "true" || pr == "1" || pr == "-1" || pr == "oui";
+            return r;
+        }
+
+        List<ClientRow> ScanClientsAndSaveCache(string dossier, int nbN)
+        {
+            DateTime start = DateTime.Now;
             var rows = new List<ClientRow>();
             dynamic t = doc.OpenTable(TBL_CLIENTS);
             try
@@ -786,24 +841,125 @@ namespace SageBridge
                 bool ok = (bool)t.First();
                 while (ok)
                 {
-                    var r = new ClientRow();
-                    r.Code = V(t, "Code");
-                    r.NomBrut = V(t, "Nom");
-                    r.Nom = Norm.Text(r.NomBrut);
-                    r.ModeTVA = V(t, "ModeTVA");
-                    r.Nii = V(t, "NII");
-                    r.PaysBrut = V(t, "FacCtyName");
-                    r.VilleBrut = (V(t, "FacCP") + " " + V(t, "FacVille")).Trim();
-                    r.Fac = new string[] { Norm.Text(V(t, "FacSociete")), Norm.Text(V(t, "FacAdresse1")), Norm.Digits(V(t, "FacCP")), Norm.Text(V(t, "FacVille")), Norm.CountryKey(FirstNonEmpty(V(t, "FacCtyCode"), V(t, "FacCtyName"))) };
-                    r.Liv = new string[] { Norm.Text(V(t, "LivSociete")), Norm.Text(V(t, "LivAdresse1")), Norm.Digits(V(t, "LivCP")), Norm.Text(V(t, "LivVille")), Norm.CountryKey(FirstNonEmpty(V(t, "LivCtyCode"), V(t, "LivCtyName"))) };
-                    string pr = V(t, "IsProspect").ToLowerInvariant();
-                    r.Prospect = pr == "true" || pr == "1" || pr == "-1" || pr == "oui";
+                    ClientRow r = BuildClientRow(t);
                     if (!string.IsNullOrEmpty(r.Code)) rows.Add(r);
                     ok = (bool)t.Next();
                 }
             }
             finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
+            SaveClientsCache(dossier, nbN, rows);
+            Log("Index clients construit : " + rows.Count + " fiche(s) en " + ((int)(DateTime.Now - start).TotalSeconds) + " s.");
             return rows;
+        }
+
+        static string ClientsCachePathFor(string dossier)
+        {
+            string d = string.IsNullOrEmpty(dossier) ? "default" : dossier;
+            foreach (char ch in Path.GetInvalidFileNameChars()) d = d.Replace(ch, '_');
+            return Path.Combine(Settings.Dir, "clients-" + d + ".cache");
+        }
+
+        List<ClientRow> LoadClientsCache(string dossier, int nbN)
+        {
+            string path = ClientsCachePathFor(dossier);
+            if (!File.Exists(path)) return null;
+            try
+            {
+                string[] lines = File.ReadAllLines(path, new UTF8Encoding(true));
+                if (lines.Length < 4) return null;
+                if (lines[0] != "# SageBridge cache clients v" + CLIENTS_CACHE_VERSION) return null;
+                if (lines[1] != "# dossier=" + dossier) return null;
+                if (lines[2] != "# nbN=" + nbN) return null;
+                var rows = new List<ClientRow>(nbN);
+                for (int i = 4; i < lines.Length; i++)
+                {
+                    ClientRow r = DeserializeClientRow(lines[i]);
+                    if (r != null && !string.IsNullOrEmpty(r.Code)) rows.Add(r);
+                }
+                Log("Index clients chargé depuis le cache (" + rows.Count + " fiche(s)).");
+                return rows;
+            }
+            catch (Exception e) { Log("Index clients : cache illisible (" + e.Message + "), reconstruction."); return null; }
+        }
+
+        void SaveClientsCache(string dossier, int nbN, List<ClientRow> rows)
+        {
+            string path = ClientsCachePathFor(dossier);
+            try
+            {
+                using (var w = new StreamWriter(path, false, new UTF8Encoding(true)))
+                {
+                    w.WriteLine("# SageBridge cache clients v" + CLIENTS_CACHE_VERSION);
+                    w.WriteLine("# dossier=" + dossier);
+                    w.WriteLine("# nbN=" + nbN);
+                    w.WriteLine("# built=" + DateTime.Now.ToString("s", CultureInfo.InvariantCulture));
+                    foreach (ClientRow r in rows) w.WriteLine(SerializeClientRow(r));
+                }
+            }
+            catch (Exception e) { Log("Index clients non enregistré : " + e.Message); }
+        }
+
+        static string Clean(string s)
+        {
+            if (s == null) return "";
+            return s.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+        }
+
+        static string SerializeClientRow(ClientRow r)
+        {
+            var cols = new string[17];
+            cols[0] = Clean(r.Code);
+            cols[1] = Clean(r.NomBrut);
+            cols[2] = Clean(r.ModeTVA);
+            cols[3] = Clean(r.Nii);
+            cols[4] = Clean(r.PaysBrut);
+            cols[5] = Clean(r.VilleBrut);
+            cols[6] = r.Prospect ? "1" : "0";
+            for (int i = 0; i < 5; i++) cols[7 + i] = Clean(r.Fac != null && i < r.Fac.Length ? r.Fac[i] : "");
+            for (int i = 0; i < 5; i++) cols[12 + i] = Clean(r.Liv != null && i < r.Liv.Length ? r.Liv[i] : "");
+            return string.Join("\t", cols);
+        }
+
+        static ClientRow DeserializeClientRow(string line)
+        {
+            if (line == null || line.Length == 0) return null;
+            string[] cols = line.Split('\t');
+            if (cols.Length < 17) return null;
+            var r = new ClientRow();
+            r.Code = cols[0];
+            r.NomBrut = cols[1];
+            r.Nom = Norm.Text(r.NomBrut);
+            r.ModeTVA = cols[2];
+            r.Nii = cols[3];
+            r.PaysBrut = cols[4];
+            r.VilleBrut = cols[5];
+            r.Prospect = cols[6] == "1";
+            r.Fac = new string[] { cols[7], cols[8], cols[9], cols[10], cols[11] };
+            r.Liv = new string[] { cols[12], cols[13], cols[14], cols[15], cols[16] };
+            return r;
+        }
+
+        // Appelée après la création réussie d'un client : ajoute la nouvelle fiche au cache
+        // (mémoire + fichier) pour que la prochaine facture n'ait pas à rebalayer la table.
+        void AddToClientsCache(string code, CustomerInfo c, CustomerInfo shipping, string modeTva, string vat, string ctyKey)
+        {
+            if (cachedClients == null) return; // ResolveClient a toujours chargé le cache avant d'arriver ici
+            CustomerInfo lv = (shipping != null && !shipping.IsEmpty) ? shipping : c;
+            string lvKey = Norm.CountryKey(lv.Country);
+            var r = new ClientRow();
+            r.Code = code;
+            r.NomBrut = c.DisplayName;
+            r.Nom = Norm.Text(r.NomBrut);
+            r.ModeTVA = modeTva;
+            r.Nii = vat;
+            r.PaysBrut = Norm.CountryName(ctyKey, c.Country);
+            r.VilleBrut = ((c.PostalCode == null ? "" : c.PostalCode) + " " + (c.City == null ? "" : c.City)).Trim();
+            r.Fac = new string[] { Norm.Text(c.DisplayName), Norm.Text(c.Address1), Norm.Digits(c.PostalCode), Norm.Text(c.City), ctyKey };
+            r.Liv = new string[] { Norm.Text(lv.DisplayName), Norm.Text(lv.Address1), Norm.Digits(lv.PostalCode), Norm.Text(lv.City), lvKey };
+            r.Prospect = false;
+            cachedClients.Add(r);
+            cachedClientsNbN++;
+            SaveClientsCache(cachedClientsDossier, cachedClientsNbN, cachedClients);
         }
 
         public List<Dictionary<string, object>> ListClients()
@@ -1139,6 +1295,7 @@ namespace SageBridge
                 if (!string.IsNullOrEmpty(outCode)) code = outCode;
                 res.ClientCode = code; res.ClientCreated = true;
                 Log("Client créé : " + code + " (" + c.DisplayName + ", " + Norm.CountryName(ctyKey, c.Country) + ", TVA " + modeTva + ")");
+                AddToClientsCache(code, c, req.Shipping, modeTva, vat, ctyKey);
                 return code;
             }
             finally
