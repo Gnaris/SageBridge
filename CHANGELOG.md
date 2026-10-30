@@ -1,5 +1,9 @@
 # Historique des versions
 
+## 1.3.5 — 30/10/2026
+
+- **Cache clients local** : SageBridge n'a plus besoin de parcourir toute la table des clients de Sage à chaque facture. Au premier appel sur un dossier il balaie la table une fois et enregistre un index dans `%APPDATA%\SageBridge\clients-<Dossier>.cache` ; les factures suivantes utilisent cet index. Le cache est reconstruit automatiquement si une fiche est ajoutée ou supprimée côté Sage (variation du nombre de fiches). Impact mesuré sur un dossier en Données Mobiles de 11 000 fiches : résolution client ~40 s → < 1 s, soit une facture d'environ 42 s à ~3 s. Les clients créés par SageBridge sont ajoutés au cache immédiatement. Si une fiche est modifiée **dans Sage** sans ajout/suppression, supprimer le fichier `.cache` force la reconstruction.
+
 ## 1.3.4 — 29/10/2026
 
 - **Dossiers en mode Données Mobiles (ou ouverts par un serveur Sage)** : on peut désormais coller dans Réglages > Dossier Sage 50 le « Chemin d'accès » affiché par Sage (Dossier > Options > Informations), qui commence par `!Srv!` (ex. `!Srv!<Smart>/S:/Données Ciel/Dossiers/…/X.SgWgc`). SageBridge le transmet tel quel à Sage au lieu de le refuser comme fichier introuvable.
