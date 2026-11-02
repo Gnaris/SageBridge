@@ -1,5 +1,19 @@
 # Historique des versions
 
+## 1.3.8 — 02/11/2026
+
+- **Rafales de factures** : plus de risque de facture « fantôme » créée dans Sage sans trace côté SageBridge quand plusieurs commandes sont envoyées coup sur coup.
+  - **Avant** : le délai de 2 min était compté depuis l'arrivée de la demande, pas depuis le début effectif du traitement. Avec 2-3 factures qui se chevauchaient en file (dossier en Données Mobiles où chaque création prend ~60 s), la 3ᵉ pouvait voir son HTTP expirer avant même que le worker ne la traite. L'action continuait en arrière-plan, la facture était bien créée dans Sage, **mais** sans ligne « Facture X créée » dans le journal ni enregistrement dans `factures.csv` → l'anti-doublon de SageBridge ne détectait pas la commande à la retentative de l'extension, et le client pouvait se retrouver avec une facture dupliquée.
+  - **Après** : les 2 min sont comptées à partir du début du traitement effectif (quand le worker prend l'action en main). L'historique et le journal sont maintenant écrits côté worker, avant même que l'HTTP ne reprenne — même si l'HTTP a abandonné sur un timeout, le journal reflète ce que Sage a réellement fait, et toute retentative de l'extension est bloquée en 409 Doublon. Garde-fou de 15 min sur l'attente en file pour éviter un blocage éternel. Incident observé le 30/10/2026 chez ISSYMA sur une rafale de 7 factures (dossier Données Mobiles de 11 000 fiches) : la facture FG1733 avait été créée dans Sage sans trace côté SageBridge.
+
+## 1.3.7 — 02/11/2026
+
+- **Clients DOM/TOM derrière un label de groupe** : fiche créée sans erreur quand la boutique envoie « France DOM/TOM » (ou tout label d'outre-mer non reconnu) comme pays. SageBridge résout maintenant le territoire à partir du code postal : 971 → Guadeloupe, 972 → Martinique, 973 → Guyane, 974 → La Réunion, 975 → Saint-Pierre-et-Miquelon, 976 → Mayotte, 97133 → Saint-Barthélemy, 97150 → Saint-Martin, 986 → Wallis-et-Futuna, 987 → Polynésie française, 988 → Nouvelle-Calédonie. Avant, le code pays restait vide et Sage refusait la fiche (« La rubrique "Code Pays" doit être remplie »). Un pays reconnu n'est jamais écrasé — une facture « France » + CP 97400 reste FR. Incident observé le 02/11/2026, client « INTERIEUR D AUJOURD HUI ».
+
+## 1.3.6 — 30/10/2026
+
+- **Clients étrangers avec accents dans le nom du pays** : fiche créée sans erreur quand le pays est aux États-Unis, en Grèce, en Côte d'Ivoire, au Sénégal, au Brésil, au Monténégro, etc. SageBridge écrivait le nom du pays avec ses accents (« États-Unis »), que la table pays interne de Sage 50 stocke sans accents (« Etats-Unis ») — Sage ne reconnaissait pas le nom, effaçait silencieusement le code pays associé, et refusait l'enregistrement avec « La rubrique "Code Pays" doit être remplie ». Correction : nom écrit sans accents, et écrit **avant** le code pays (Sage recouple nom↔code quand on écrit le nom — en écrivant d'abord le nom puis le code, le code reste la dernière valeur posée). Incident observé le 30/10/2026 sur la commande KJ25KJNK, client « Accent Piece LLC » (US).
+
 ## 1.3.5 — 30/10/2026
 
 - **Cache clients local** : SageBridge n'a plus besoin de parcourir toute la table des clients de Sage à chaque facture. Au premier appel sur un dossier il balaie la table une fois et enregistre un index dans `%APPDATA%\SageBridge\clients-<Dossier>.cache` ; les factures suivantes utilisent cet index. Le cache est reconstruit automatiquement si une fiche est ajoutée ou supprimée côté Sage (variation du nombre de fiches). Impact mesuré sur un dossier en Données Mobiles de 11 000 fiches : résolution client ~40 s → < 1 s, soit une facture d'environ 42 s à ~3 s. Les clients créés par SageBridge sont ajoutés au cache immédiatement. Si une fiche est modifiée **dans Sage** sans ajout/suppression, supprimer le fichier `.cache` force la reconstruction.
