@@ -33,8 +33,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.5.0")]
-[assembly: AssemblyFileVersion("1.3.5.0")]
+[assembly: AssemblyVersion("1.3.8.0")]
+[assembly: AssemblyFileVersion("1.3.8.0")]
 
 namespace SageBridge
 {
@@ -416,6 +416,44 @@ namespace SageBridge
             return t; // pays non reconnu : nom normalisé
         }
 
+        // Résolution DOM/TOM par code postal français à 5 chiffres (97xxx / 98xxx).
+        // Sert quand une boutique envoie un label de groupe (ex. « France DOM/TOM »,
+        // « France Outre-Mer ») que ni Sage ni la table des pays ne reconnaissent :
+        // sans ce repli, FacCtyCode reste vide et Sage refuse la fiche avec « La
+        // rubrique Code Pays doit être remplie ». Incident 02/11/2026, commande
+        // chez Boris, client « INTERIEUR D AUJOURD HUI » (pays « France DOM/TOM »).
+        public static string PostalCodeToDomTomKey(string postalCode)
+        {
+            string d = Digits(postalCode);
+            if (d.Length < 3) return "";
+            // Cas spécifiques (chevauchent 971xx) :
+            if (d.StartsWith("97133")) return "BL"; // Saint-Barthélemy
+            if (d.StartsWith("97150")) return "MF"; // Saint-Martin
+            string p3 = d.Substring(0, 3);
+            if (p3 == "971") return "GP"; // Guadeloupe
+            if (p3 == "972") return "MQ"; // Martinique
+            if (p3 == "973") return "GF"; // Guyane
+            if (p3 == "974") return "RE"; // La Réunion
+            if (p3 == "975") return "PM"; // Saint-Pierre-et-Miquelon
+            if (p3 == "976") return "YT"; // Mayotte
+            if (p3 == "986") return "WF"; // Wallis-et-Futuna
+            if (p3 == "987") return "PF"; // Polynésie française
+            if (p3 == "988") return "NC"; // Nouvelle-Calédonie
+            return "";
+        }
+
+        // Clé pays avec repli DOM/TOM par CP : si le pays n'est pas reconnu et que le
+        // code postal pointe sur un territoire d'outre-mer français, on retourne le
+        // code ISO 2 du territoire. Un pays reconnu n'est jamais écrasé (une facture
+        // « France » + CP 97400 reste FR : si Boris a choisi « France », c'est voulu).
+        public static string CountryKeyWithPostal(string country, string postalCode)
+        {
+            string key = CountryKey(country);
+            if (IsKnownCountry(key)) return key;
+            string fromCp = PostalCodeToDomTomKey(postalCode);
+            return fromCp.Length > 0 ? fromCp : key;
+        }
+
         public static bool IsKnownCountry(string key)
         {
             foreach (string[] row in CountryTable) if (row[0] == key) return true;
@@ -432,6 +470,23 @@ namespace SageBridge
         {
             foreach (string[] row in CountryTable) if (row[0] == key) return row[2];
             return fallback;
+        }
+
+        // Nom du pays sans accents, pour matcher la table pays interne de Sage.
+        // Sage 50 stocke généralement les noms sans accents (ex. « Etats-Unis »,
+        // pas « États-Unis »). Si on écrit un nom avec accents dans FacCtyName,
+        // Sage ne le reconnaît pas et efface silencieusement FacCtyCode associé
+        // → erreur « Code Pays doit être rempli » à Save(). Incident 30/10/2026
+        // commande KJ25KJNK, client « Accent Piece LLC » (US).
+        public static string CountryNameForSage(string key, string fallback)
+        {
+            string name = CountryName(key, fallback);
+            if (string.IsNullOrEmpty(name)) return name;
+            string d = name.Normalize(NormalizationForm.FormD);
+            var sb = new StringBuilder(d.Length);
+            foreach (char c in d)
+                if (CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark) sb.Append(c);
+            return sb.ToString();
         }
 
         // Mode TVA Sage selon le pays de facturation : France et Monaco → Local ;
@@ -624,12 +679,22 @@ namespace SageBridge
                     (cfg.DossierName.Length > 0 ? " (dossier " + cfg.DossierName + ")" : "") + " puis réessayez.");
             T result = default(T);
             Exception error = null;
+            var started = new ManualResetEvent(false);
             var done = new ManualResetEvent(false);
             queue.Add(delegate
             {
+                started.Set();
                 try { result = f(); } catch (Exception e) { error = e; }
                 done.Set();
             });
+            // Les 120 s sont comptées à partir du DÉBUT de l'action, pas de sa mise en file.
+            // Incident ISSYMA 30/10/2026 : avec 3 factures en rafale, la 3ᵉ a vu son HTTP
+            // expirer alors qu'elle attendait encore son tour ; l'action a continué, la
+            // facture a été créée dans Sage sans journalisation ni historique (donc risque
+            // de doublon à la retentative). Le garde-fou de 15 min sur l'attente en file
+            // permet aux rafales longues de passer tout en évitant un blocage éternel.
+            if (!started.WaitOne(900000))
+                throw new Exception("Sage très sollicité : la demande est restée en file plus de 15 minutes. Vérifiez l'état de Sage et réessayez.");
             if (!done.WaitOne(120000))
             {
                 queue.Add(delegate { Reset(); });
@@ -736,25 +801,32 @@ namespace SageBridge
             done.WaitOne(timeoutMs);
         }
 
-        public InvoiceResult Create(InvoiceRequest req)
+        public InvoiceResult Create(InvoiceRequest req, Action<InvoiceResult> onCompleted)
         {
             return Run<InvoiceResult>(delegate
             {
-                try { return CreateInner(req); }
+                InvoiceResult r;
+                try { r = CreateInner(req); }
                 catch (Exception first)
                 {
                     // Une reconnexion suffit souvent (Sage redémarré entre-temps, etc.).
                     Log("Échec (" + ComMessage(first) + "), nouvelle tentative après reconnexion…");
                     Reset();
-                    try { return CreateInner(req); }
+                    try { r = CreateInner(req); }
                     catch (Exception second)
                     {
                         Reset();
-                        var r = new InvoiceResult();
+                        r = new InvoiceResult();
                         r.Error = ComMessage(second);
-                        return r;
                     }
                 }
+                // Appelé depuis le thread worker, AVANT que l'HTTP ne reprenne : l'historique
+                // et le journal reflètent toujours ce que Sage a réellement fait, même si
+                // l'HTTP a abandonné sur timeout. Sans ça, une facture créée dans Sage par
+                // une rafale longue pouvait rester invisible côté SageBridge → doublon à la
+                // retentative de l'extension (incident ISSYMA 30/10/2026, FG1733).
+                if (onCompleted != null) { try { onCompleted(r); } catch { } }
+                return r;
             });
         }
 
@@ -769,7 +841,7 @@ namespace SageBridge
 
         static string[] Block(CustomerInfo c)
         {
-            return new[] { Norm.Text(c.DisplayName), Norm.Text(c.Address1), Norm.Digits(c.PostalCode), Norm.Text(c.City), Norm.CountryKey(c.Country) };
+            return new[] { Norm.Text(c.DisplayName), Norm.Text(c.Address1), Norm.Digits(c.PostalCode), Norm.Text(c.City), Norm.CountryKeyWithPostal(c.Country, c.PostalCode) };
         }
 
         static bool SameBlock(string[] want, string nomClient, string[] have)
@@ -945,7 +1017,7 @@ namespace SageBridge
         {
             if (cachedClients == null) return; // ResolveClient a toujours chargé le cache avant d'arriver ici
             CustomerInfo lv = (shipping != null && !shipping.IsEmpty) ? shipping : c;
-            string lvKey = Norm.CountryKey(lv.Country);
+            string lvKey = Norm.CountryKeyWithPostal(lv.Country, lv.PostalCode);
             var r = new ClientRow();
             r.Code = code;
             r.NomBrut = c.DisplayName;
@@ -1225,6 +1297,15 @@ namespace SageBridge
             }
 
             string ctyKey = Norm.CountryKey(c.Country);
+            if (!Norm.IsKnownCountry(ctyKey))
+            {
+                string fromCp = Norm.PostalCodeToDomTomKey(c.PostalCode);
+                if (fromCp.Length > 0)
+                {
+                    res.Messages.Add("Pays « " + c.Country + " » reconnu comme « " + Norm.CountryName(fromCp, fromCp) + " » via le code postal " + c.PostalCode + ".");
+                    ctyKey = fromCp;
+                }
+            }
             string modeTva = Norm.VatModeForCountry(ctyKey);
             if (!Norm.IsKnownCountry(ctyKey))
                 res.Messages.Add("Pays « " + c.Country + " » non reconnu : mode TVA « " + modeTva + " » par défaut, à vérifier sur la fiche.");
@@ -1252,8 +1333,12 @@ namespace SageBridge
                 SetF(cli, "FacAdresse2", c.Address2, res, "complément d'adresse");
                 SetF(cli, "FacCP", c.PostalCode, res, "code postal");
                 SetF(cli, "FacVille", c.City, res, "ville");
+                // Nom AVANT code : Sage recouple code↔nom quand on écrit le nom.
+                // Un nom non reconnu (ex. « États-Unis » avec accent, alors que la
+                // table pays Sage a « Etats-Unis » sans accent) efface le code.
+                // On écrit donc d'abord le nom normalisé (sans accents) puis le code.
+                SetF(cli, "FacCtyName", Norm.CountryNameForSage(ctyKey, c.Country), res, "pays");
                 SetF(cli, "FacCtyCode", Norm.CountryIso3(ctyKey), res, "code pays");
-                SetF(cli, "FacCtyName", Norm.CountryName(ctyKey, c.Country), res, "pays");
                 SetF(cli, "FacTel", c.Phone, res, "téléphone");
                 SetF(cli, "Email", c.Email, res, "e-mail");
                 string siret = SiretValid(c.Siret) ? Norm.Digits(c.Siret) : "";
@@ -1266,14 +1351,14 @@ namespace SageBridge
                 // Adresse de livraison : Sage la pré-remplit avec la facturation, les champs vides
                 // sont donc effacés explicitement avec une espace.
                 CustomerInfo l = (req.Shipping != null && !req.Shipping.IsEmpty) ? req.Shipping : c;
-                string lKey = Norm.CountryKey(l.Country);
+                string lKey = Norm.CountryKeyWithPostal(l.Country, l.PostalCode);
                 SetF(cli, "LivSociete", l.DisplayName, res, "société (livraison)");
                 SetF(cli, "LivAdresse1", l.Address1, res, "adresse (livraison)");
                 SetF(cli, "LivAdresse2", string.IsNullOrEmpty(l.Address2) ? " " : l.Address2, res, "complément (livraison)");
                 SetF(cli, "LivCP", l.PostalCode, res, "code postal (livraison)");
                 SetF(cli, "LivVille", l.City, res, "ville (livraison)");
+                SetF(cli, "LivCtyName", Norm.CountryNameForSage(lKey, l.Country), res, "pays (livraison)");
                 SetF(cli, "LivCtyCode", Norm.CountryIso3(lKey), res, "code pays (livraison)");
-                SetF(cli, "LivCtyName", Norm.CountryName(lKey, l.Country), res, "pays (livraison)");
                 SetF(cli, "LivTel", FirstNonEmpty(l.Phone, FirstNonEmpty(c.Phone, " ")), res, "téléphone (livraison)");
 
                 string outCode = code;
@@ -2252,12 +2337,20 @@ namespace SageBridge
                 }
             }
             LogLine((req.Simulation ? "Simulation : " : "Création : ") + req.Site + " " + req.OrderNo + " — " + req.Lines.Count + " ligne(s)");
-            InvoiceResult res = sage.Create(req);
+            // Le callback est exécuté sur le thread worker avant même le retour de Create :
+            // l'historique et le journal reflètent toujours ce que Sage a fait, y compris
+            // quand l'HTTP a déjà renvoyé une erreur de timeout entre-temps.
+            return sage.Create(req, delegate(InvoiceResult r) { RecordInvoiceOutcome(req, r); });
+        }
+
+        void RecordInvoiceOutcome(InvoiceRequest req, InvoiceResult res)
+        {
             if (res.Ok && res.Simulated)
             {
                 LogLine("Simulation terminée : client " + (string.IsNullOrEmpty(res.ClientCode) ? "à créer" : res.ClientCode) + ", mode TVA " + res.ClientModeTVA + ".");
+                return;
             }
-            else if (res.Ok)
+            if (res.Ok)
             {
                 if (!string.IsNullOrEmpty(req.OrderNo)) history.Add(req.Site, req.OrderNo, res.Numero, res.ClientCode, res.NbLines, res.TotalHT);
                 LogLine("Facture " + res.Numero + " créée (provisoire) — client " + res.ClientCode + (res.ClientCreated ? " (nouveau)" : "") + " — total HT " + res.TotalHT.ToString("0.00") + " €");
@@ -2269,8 +2362,7 @@ namespace SageBridge
                 LogLine("ÉCHEC : " + res.Error);
                 SetStatus("Échec de la dernière facture : " + res.Error, Red);
             }
-            if (!res.Simulated) AddResultRow(req, res);
-            return res;
+            AddResultRow(req, res);
         }
 
         void AddHistoryRow(string[] p)
