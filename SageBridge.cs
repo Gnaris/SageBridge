@@ -34,8 +34,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.10.0")]
-[assembly: AssemblyFileVersion("1.3.10.0")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
 
 namespace SageBridge
 {
@@ -104,6 +104,10 @@ namespace SageBridge
         public bool AutoUpdate = true;      // installe seul les nouvelles versions publiées sur GitHub
         public bool WriteReference = false; // écrire le champ « reference » reçu dans la Référence de la facture (désactivé par défaut)
         public string Repo = Updater.DefaultRepo;
+        public string RecapDir = "";        // dossier des PDF de factures, choisi par l'utilisateur (aucun par défaut)
+        public string PdfModel = "Format A4 Complet"; // modèle Sage utilisé pour l'aperçu exporté en PDF
+
+        public string RecapRoot { get { return RecapDir; } }
 
         static readonly object logSync = new object();
 
@@ -155,6 +159,8 @@ namespace SageBridge
                 else if (k == "article_test") s.TestArticle = v;
                 else if (k == "maj_auto") s.AutoUpdate = v != "0";
                 else if (k == "reference_facture") s.WriteReference = v == "1";
+                else if (k == "recap") s.RecapDir = v;
+                else if (k == "modele_pdf" && v.Length > 0) s.PdfModel = v;
                 else if (k == "depot" && Regex.IsMatch(v, @"^[\w.-]+/[\w.-]+$")) s.Repo = v;
             }
             return s;
@@ -169,6 +175,8 @@ namespace SageBridge
                 "article_test=" + TestArticle + "\r\n" +
                 "maj_auto=" + (AutoUpdate ? "1" : "0") + "\r\n" +
                 "reference_facture=" + (WriteReference ? "1" : "0") + "\r\n" +
+                "recap=" + RecapDir + "\r\n" +
+                "modele_pdf=" + PdfModel + "\r\n" +
                 "depot=" + Repo + "\r\n", Encoding.UTF8);
         }
 
@@ -313,6 +321,18 @@ namespace SageBridge
         }
 
         public string NomAffiche { get { return Societe.Length > 0 ? Societe : CliName; } }
+    }
+
+    // Pièce à enregistrer en PDF (facture ou avoir validé), avec son UD dans la table PieceHCli.
+    class PdfPiece
+    {
+        public string Num = "", TypePiece = "", Kind = "", Nom = "";
+        public DateTime Date;
+        public double TotalTTC;
+        public bool Valide;
+        public int UD;
+        // Résultat de l'export
+        public string Existing = "", Target = "", Status = "", Error = "";
     }
 
     // ───────────────────────── Normalisation (sans accents, sans casse) ─────────────────────────
@@ -1436,6 +1456,129 @@ namespace SageBridge
             });
         }
 
+        // ── Export PDF des pièces (1.4.0) ──
+        // Tâche « Impression pièce client » (eTaskIds.kWgcTaskIdPieceCliPrint, valeur COMPLÈTE : contrairement aux
+        // tables, l'octet haut distingue les tâches). Params = ITable « PieceCli » ; rubriques vérifiées live le 03/11/2026 :
+        // 1 Sel (sélection d'UD de PieceHCli : SEULE façon de désigner la pièce, PieceId/ManNum seuls → rien),
+        // 2 NoAskConfirm, 4 PieceType, 20 PrnDst (liste : Demander, Imprimante, Ecran, Silencieux, « Ficher PDF »,
+        // Envoyer par e-mail), 38 PrnReportName (nom du modèle). « Ficher PDF » → boîte « Paramètres incorrects »
+        // (aucun champ pour le chemin) : on passe donc par l'aperçu « Ecran », puis Exporter en PDF (SagePdfExporter).
+        public const int TASK_PIECE_CLI_PRINT = 0x12017AF5;
+
+        // Factures et avoirs VALIDÉS dont la date de pièce tombe dans le mois donné (les provisoires n'ont pas
+        // encore leur numéro définitif). Lecture seule.
+        public List<PdfPiece> ListPiecesForMonth(int year, int month)
+        {
+            return Run<List<PdfPiece>>(delegate
+            {
+                try { return ListPiecesForMonthInner(year, month); }
+                catch (Exception first)
+                {
+                    Log("Échec (" + ComMessage(first) + "), nouvelle tentative après reconnexion…");
+                    Reset();
+                    return ListPiecesForMonthInner(year, month);
+                }
+            }, 600000);
+        }
+
+        static DateTime ValDate(dynamic t, int fid)
+        {
+            try
+            {
+                object o = t.GetVal(fid);
+                if (o is DateTime) return (DateTime)o;
+                DateTime d; string s = Convert.ToString(o, CultureInfo.InvariantCulture);
+                if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out d)) return d;
+                if (DateTime.TryParse(s, CultureInfo.GetCultureInfo("fr-FR"), DateTimeStyles.None, out d)) return d;
+            }
+            catch { }
+            return DateTime.MinValue;
+        }
+
+        List<PdfPiece> ListPiecesForMonthInner(int year, int month)
+        {
+            EnsureOpen();
+            var outp = new List<PdfPiece>();
+            dynamic t = doc.OpenTable(TBL_PIECES_CLI);
+            try
+            {
+                string tname = "";
+                try { tname = (string)t.TableName; } catch { }
+                if (!string.Equals(tname, "PieceHCli", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("La table des pièces clients n'a pas été trouvée (table « " + tname + " » à la place) : version de Sage 50 non prise en charge.");
+                var f = new Dictionary<string, int>(PieceFieldDefaults, StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    dynamic coll = t.Fields;
+                    int n = (int)coll.Count;
+                    for (int i = 1; i <= n; i++)
+                    {
+                        try { dynamic fd = coll.Item(i); string nm = (string)fd.Name; if (f.ContainsKey(nm)) f[nm] = (int)fd.Id; } catch { }
+                    }
+                }
+                catch { }
+                bool more = false;
+                try { more = (bool)t.First(); } catch { }
+                int safety = 500000;
+                while (more && safety-- > 0)
+                {
+                    DateTime dt = ValDate(t, f["DtPiece"]);
+                    if (dt.Year == year && dt.Month == month)
+                    {
+                        var p = new PdfPiece();
+                        p.Num = ValStr(t, f["Num"]);
+                        p.TypePiece = ValStr(t, f["TypePiece"]);
+                        p.Date = dt;
+                        string soc = ValStr(t, f["Societe"]);
+                        p.Nom = soc.Length > 0 ? soc : ValStr(t, f["CliName"]);
+                        p.TotalTTC = ValNum(t, f["TotalTTC"]);
+                        p.Valide = ValBool(t, f["Valide"]);
+                        try { p.UD = (int)t.CurUD; } catch { }
+                        string k = Norm.Text(p.TypePiece);
+                        p.Kind = k.Contains("avoir") ? "avoir" : (k.Contains("facture") && !k.Contains("acompte") ? "facture" : "");
+                        if (p.Num.Length > 0 && p.Kind.Length > 0 && p.Valide && p.UD != 0) outp.Add(p);
+                    }
+                    try { more = (bool)t.Next(); } catch { break; }
+                }
+            }
+            finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
+            outp.Sort(delegate(PdfPiece a, PdfPiece b) { int c = string.CompareOrdinal(a.Kind, b.Kind); return c != 0 ? -c : string.CompareOrdinal(a.Num, b.Num); });
+            Log("Pièces validées de " + month.ToString("00") + "/" + year + " : " + outp.Count + ".");
+            return outp;
+        }
+
+        // Ouvre l'aperçu écran de la pièce avec le modèle donné. Rend la main dès que l'aperçu est affiché
+        // (la fenêtre d'aperçu ne bloque pas le thread COM : vérifié live, ~1 s).
+        public void OpenPreview(PdfPiece p, string model)
+        {
+            Run<bool>(delegate
+            {
+                EnsureOpen();
+                dynamic task = doc.CreateTask(TASK_PIECE_CLI_PRINT);
+                if (task == null) throw new Exception("Sage n'a pas créé la tâche d'impression.");
+                dynamic prm = null, sel = null;
+                try
+                {
+                    prm = task.Params;
+                    sel = app.CreateSelection();
+                    sel.AddUD(p.UD);
+                    prm.SetVal(1, sel);
+                    prm.SetVal(2, 1);
+                    prm.SetVal(4, p.Kind == "avoir" ? 5 : TYPE_FACTURE);
+                    prm.SetVal(20, "Ecran");
+                    if (!string.IsNullOrEmpty(model)) prm.SetVal(38, model);
+                    task.Run();
+                    return true;
+                }
+                finally
+                {
+                    try { if (sel != null) Marshal.FinalReleaseComObject(sel); } catch { }
+                    try { if (prm != null) Marshal.FinalReleaseComObject(prm); } catch { }
+                    try { Marshal.FinalReleaseComObject(task); } catch { }
+                }
+            });
+        }
+
         // Code suivant en respectant le format dominant du dossier (ex. « 281 » → « 282 », « CLI0041 » → « CLI0042 »).
         static string NextClientCode(List<ClientRow> rows)
         {
@@ -2425,6 +2568,7 @@ namespace SageBridge
             buttons.Controls.Add(btnTest);
             buttons.Controls.Add(MakeButton("Ouvrir Sage 50", delegate { OpenSage(); }));
             buttons.Controls.Add(MakeButton("Rapport de paiement…", delegate { OpenPaymentReport(); }));
+            buttons.Controls.Add(MakeButton("Enregistrer les PDF…", delegate { OpenPdfExport(); }));
             buttons.Controls.Add(MakeButton("Historique", delegate { OpenFile(Settings.HistoryFile, "Aucune facture n'a encore été créée."); }));
             buttons.Controls.Add(MakeButton("Journal", delegate { OpenFile(Settings.LogFile, "Le journal est vide."); }));
             var btnDoc = MakeButton("Documentation", delegate { OpenFile(Program.DocPath, "La documentation n'est pas installée à côté du programme."); });
@@ -2741,6 +2885,22 @@ namespace SageBridge
             try
             {
                 using (var f = new ReconcileForm(file, sage, history.FindByOrder, LogLine)) f.ShowDialog(this);
+            }
+            finally { Interlocked.Decrement(ref busy); }
+        }
+
+        // Enregistrement des factures/avoirs validés d'un mois en PDF (modèle choisi) dans Recap\année\mois\Facture|Avoir.
+        void OpenPdfExport()
+        {
+            if (!SageWorker.SageWindowOpen())
+            {
+                MessageBox.Show(this, "Ouvrez d'abord Sage 50" + (cfg.DossierName.Length > 0 ? " sur le dossier « " + cfg.DossierName + " »" : "") + ".", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            Interlocked.Increment(ref busy);
+            try
+            {
+                using (var f = new PdfExportForm(cfg, sage, LogLine)) f.ShowDialog(this);
             }
             finally { Interlocked.Decrement(ref busy); }
         }
@@ -3685,6 +3845,582 @@ namespace SageBridge
                     e.Cancel = true;
                 }
             };
+        }
+    }
+
+    // ───────────────────────── Export PDF : pilotage de l'aperçu de Sage ─────────────────────────
+    // Reproduit le geste de l'utilisateur : aperçu de la pièce (modèle choisi) > Exporter en PDF > Exporter tout
+    // en PDF > Enregistrer sous (chemin complet) > fermeture de l'aperçu. Sage n'offre pas d'export PDF par COM
+    // (« Ficher PDF » → « Paramètres incorrects », tâche EngPrn → « Fonction non implémentée ») : on passe par
+    // des messages Windows envoyés aux fenêtres de WGC.exe, sans toucher à la souris ni au clavier réels.
+    // Vérifié live le 03/11/2026 (FA10005913 : fichier identique à l'octet près à l'export manuel).
+    static class SagePdfExporter
+    {
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr p, EnumProc f, IntPtr l);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+        [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageTimeoutW")] static extern IntPtr SendMessageTimeoutStr(IntPtr h, uint m, IntPtr w, string l, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr h);
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+
+        const uint WM_SETTEXT = 0x000C, WM_CLOSE = 0x0010, WM_COMMAND = 0x0111, WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101,
+            WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, MN_SELECTITEM = 0x01E5, SMTO_ABORTIFHUNG = 2;
+        const int VK_RETURN = 0x0D, VK_ESCAPE = 0x1B, IDOK = 1, IDCANCEL = 2;
+        // Bouton « Exporter en PDF » dans le ruban de l'aperçu (coordonnées client du ruban à 96 ppp, Sage 50 v6.71).
+        const int EXPORT_X = 232, EXPORT_Y = 18;
+
+        class Win { public IntPtr H; public string Cls = "", Title = ""; }
+
+        static string ClassOf(IntPtr h) { var sb = new StringBuilder(256); GetClassName(h, sb, 256); return sb.ToString(); }
+        static string TitleOf(IntPtr h) { var sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString(); }
+
+        static List<Win> TopWindows(int pid)
+        {
+            var r = new List<Win>();
+            EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                uint p; GetWindowThreadProcessId(h, out p);
+                if (p == (uint)pid && IsWindowVisible(h)) r.Add(new Win { H = h, Cls = ClassOf(h), Title = TitleOf(h) });
+                return true;
+            }, IntPtr.Zero);
+            return r;
+        }
+
+        static List<Win> Children(IntPtr parent)
+        {
+            var r = new List<Win>();
+            EnumChildWindows(parent, delegate(IntPtr h, IntPtr l) { r.Add(new Win { H = h, Cls = ClassOf(h), Title = TitleOf(h) }); return true; }, IntPtr.Zero);
+            return r;
+        }
+
+        static int SagePid()
+        {
+            foreach (Process p in Process.GetProcessesByName("WGC"))
+            {
+                try { if (p.MainWindowHandle != IntPtr.Zero) return p.Id; }
+                catch { }
+                finally { p.Dispose(); }
+            }
+            return 0;
+        }
+
+        static Win WaitFor(Func<Win> probe, int ms)
+        {
+            DateTime end = DateTime.Now.AddMilliseconds(ms);
+            while (true)
+            {
+                Win w = probe();
+                if (w != null || DateTime.Now >= end) return w;
+                Thread.Sleep(200);
+            }
+        }
+
+        static void Command(IntPtr dlg, int id, IntPtr ctl)
+        {
+            IntPtr r; SendMessageTimeout(dlg, WM_COMMAND, (IntPtr)id, ctl, SMTO_ABORTIFHUNG, 5000, out r);
+        }
+
+        static void Click(IntPtr h, int x, int y)
+        {
+            IntPtr lp = (IntPtr)((y << 16) | (x & 0xFFFF));
+            PostMessage(h, WM_MOUSEMOVE, IntPtr.Zero, lp);
+            PostMessage(h, WM_LBUTTONDOWN, (IntPtr)1, lp);
+            Thread.Sleep(120);
+            PostMessage(h, WM_LBUTTONUP, IntPtr.Zero, lp);
+        }
+
+        // Texte des libellés d'une boîte de message de Sage (pour l'afficher à l'utilisateur).
+        static string DialogText(IntPtr dlg)
+        {
+            var parts = new List<string>();
+            foreach (Win c in Children(dlg))
+                if (c.Cls == "Static" && c.Title.Trim().Length > 0) parts.Add(c.Title.Trim());
+            return string.Join(" ", parts.ToArray());
+        }
+
+        static bool HasOkButton(IntPtr dlg)
+        {
+            foreach (Win c in Children(dlg))
+                if (c.Cls == "Button" && c.Title.Replace("&", "").Trim() == "OK" && IsWindowVisible(c.H)) return true;
+            return false;
+        }
+
+        // Ferme proprement les fenêtres ouvertes par l'export : boîtes de message (OK), « Enregistrer sous » (Annuler), menus.
+        static void CloseStray(int pid, HashSet<IntPtr> before)
+        {
+            foreach (Win w in TopWindows(pid))
+            {
+                if (before.Contains(w.H)) continue;
+                if (w.Cls == "#32768") { PostMessage(w.H, WM_KEYDOWN, (IntPtr)VK_ESCAPE, IntPtr.Zero); PostMessage(w.H, WM_KEYUP, (IntPtr)VK_ESCAPE, IntPtr.Zero); }
+                else if (w.Cls == "#32770") Command(w.H, IDCANCEL, IntPtr.Zero);
+                else if (w.Cls == "CamDialogNC")
+                {
+                    foreach (Win c in Children(w.H))
+                        if (c.Cls == "Button" && c.Title.Replace("&", "") == "OK") { Command(w.H, GetDlgCtrlID(c.H), c.H); break; }
+                }
+            }
+        }
+
+        public static void Export(SageWorker sage, PdfPiece p, string model, string target)
+        {
+            int pid = SagePid();
+            if (pid == 0) throw new Exception("Sage 50 n'est pas ouvert.");
+            var before = new HashSet<IntPtr>();
+            foreach (Win w in TopWindows(pid)) before.Add(w.H);
+
+            sage.OpenPreview(p, model);
+            string suffix = " - " + p.Num;
+            Win prev = WaitFor(delegate
+            {
+                foreach (Win w in TopWindows(pid))
+                    if (!before.Contains(w.H) && w.Cls == "CamDialog" && w.Title.StartsWith("Aper") && w.Title.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return w;
+                return null;
+            }, 30000);
+            if (prev == null)
+            {
+                CloseStray(pid, before);
+                throw new Exception("l'aperçu de la pièce ne s'est pas ouvert dans Sage (modèle « " + model + " » introuvable ?).");
+            }
+            try
+            {
+                Thread.Sleep(700); // le ruban et la page finissent de s'afficher
+                IntPtr ribbon = IntPtr.Zero;
+                foreach (Win c in Children(prev.H)) if (c.Cls == "{{ribbon}}") { ribbon = c.H; break; }
+                if (ribbon == IntPtr.Zero) throw new Exception("barre d'outils de l'aperçu introuvable.");
+                uint dpi = 96;
+                try { dpi = GetDpiForWindow(ribbon); if (dpi == 0) dpi = 96; } catch { dpi = 96; }
+                int x = (int)(EXPORT_X * dpi / 96), y = (int)(EXPORT_Y * dpi / 96);
+
+                Win menu = null;
+                for (int attempt = 0; attempt < 3 && menu == null; attempt++)
+                {
+                    Click(ribbon, x, y);
+                    menu = WaitFor(delegate
+                    {
+                        foreach (Win w in TopWindows(pid)) if (!before.Contains(w.H) && w.Cls == "#32768") return w;
+                        return null;
+                    }, 3000);
+                }
+                if (menu == null) throw new Exception("le menu « Exporter en PDF » de l'aperçu ne s'est pas ouvert.");
+                IntPtr r;
+                SendMessageTimeout(menu.H, MN_SELECTITEM, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 3000, out r); // « Exporter tout en PDF »
+                Thread.Sleep(150);
+                PostMessage(menu.H, WM_KEYDOWN, (IntPtr)VK_RETURN, IntPtr.Zero);
+                PostMessage(menu.H, WM_KEYUP, (IntPtr)VK_RETURN, IntPtr.Zero);
+
+                Win save = WaitFor(delegate
+                {
+                    foreach (Win w in TopWindows(pid)) if (!before.Contains(w.H) && w.Cls == "#32770") return w;
+                    return null;
+                }, 20000);
+                if (save == null) throw new Exception("la fenêtre « Enregistrer sous » de Sage ne s'est pas ouverte.");
+                Thread.Sleep(300);
+                IntPtr edit = IntPtr.Zero, okBtn = IntPtr.Zero;
+                foreach (Win c in Children(save.H))
+                {
+                    int id = GetDlgCtrlID(c.H);
+                    if (c.Cls == "Edit" && (id == 1148 || id == 1152) && edit == IntPtr.Zero) edit = c.H;
+                    if (c.Cls == "Button" && id == IDOK) okBtn = c.H;
+                }
+                if (edit == IntPtr.Zero) throw new Exception("zone « Nom du fichier » introuvable dans la fenêtre « Enregistrer sous ».");
+                SendMessageTimeoutStr(edit, WM_SETTEXT, IntPtr.Zero, target, SMTO_ABORTIFHUNG, 5000, out r);
+                Thread.Sleep(150);
+                Command(save.H, IDOK, okBtn);
+
+                // Attente du fichier (taille stable) ; toute nouvelle boîte de Sage est une erreur à remonter.
+                DateTime end = DateTime.Now.AddSeconds(90);
+                long lastLen = -1; int stable = 0;
+                while (DateTime.Now < end)
+                {
+                    Thread.Sleep(400);
+                    try
+                    {
+                        var fi = new FileInfo(target);
+                        if (fi.Exists && fi.Length > 0)
+                        {
+                            if (fi.Length == lastLen) { if (++stable >= 2) return; }
+                            else { lastLen = fi.Length; stable = 0; }
+                            continue;
+                        }
+                    }
+                    catch { }
+                    foreach (Win w in TopWindows(pid))
+                    {
+                        if (before.Contains(w.H) || w.H == prev.H) continue;
+                        // Erreur = boîte de message avec un bouton OK. La fenêtre de progression de Sage
+                        // (« … calcul en cours … Traitement en cours … », CamDialogNC sans OK) est normale.
+                        if ((w.Cls == "CamDialogNC" || (w.Cls == "#32770" && w.H != save.H)) && HasOkButton(w.H))
+                            throw new Exception("Sage : " + DialogText(w.H));
+                    }
+                }
+                throw new Exception("le fichier PDF n'a pas été créé dans le délai (90 s).");
+            }
+            finally
+            {
+                CloseStray(pid, before);
+                PostMessage(prev.H, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                DateTime end = DateTime.Now.AddSeconds(8);
+                while (IsWindow(prev.H) && IsWindowVisible(prev.H) && DateTime.Now < end) Thread.Sleep(200);
+            }
+        }
+    }
+
+    // Rangement des PDF : Recap\<année>\<n°>. <Mois>\Facture|Avoir\<numéro>.pdf. Un dossier existant est réutilisé
+    // tel quel (« Novembre » ou « 11. Novembre », « Facture » ou « Factures ») ; sinon il est créé au format « 11. Novembre ».
+    static class RecapFolders
+    {
+        public static readonly string[] Mois = { "Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre" };
+
+        static string FindSub(string dir, Func<string, bool> match)
+        {
+            if (!Directory.Exists(dir)) return null;
+            try { foreach (string d in Directory.GetDirectories(dir)) if (match(Path.GetFileName(d))) return d; } catch { }
+            return null;
+        }
+
+        public static string MonthDir(string root, int year, int month, bool create)
+        {
+            string yearDir = Path.Combine(root, year.ToString(CultureInfo.InvariantCulture));
+            string want = Norm.Text(Mois[month - 1]);
+            string found = FindSub(yearDir, delegate(string name) { return Regex.Replace(Norm.Text(name), @"^\d+\s*", "") == want; });
+            if (found != null) return found;
+            string dir = Path.Combine(yearDir, month + ". " + Mois[month - 1]);
+            if (create) Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        public static string TypeDir(string monthDir, string kind, bool create)
+        {
+            string a = kind == "avoir" ? "avoir" : "facture";
+            string found = FindSub(monthDir, delegate(string name) { string n = Norm.Text(name); return n == a || n == a + "s"; });
+            if (found != null) return found;
+            string dir = Path.Combine(monthDir, kind == "avoir" ? "Avoir" : "Facture");
+            if (create) Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        // PDF déjà présents n'importe où sous Recap, indexés par le numéro de pièce en tête du nom :
+        // « FA10005662 Reçu le 06-10-2026.pdf » compte pour FA10005662 (fichiers renommés ou déplacés à la main).
+        public static Dictionary<string, string> IndexExisting(string root)
+        {
+            var idx = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var stack = new Stack<string>();
+            if (Directory.Exists(root)) stack.Push(root);
+            var re = new Regex(@"^([A-Za-z]*\d+)");
+            while (stack.Count > 0)
+            {
+                string d = stack.Pop();
+                try { foreach (string sub in Directory.GetDirectories(d)) stack.Push(sub); } catch { }
+                try
+                {
+                    foreach (string f in Directory.GetFiles(d, "*.pdf"))
+                    {
+                        Match m = re.Match(Path.GetFileName(f));
+                        if (m.Success && !idx.ContainsKey(m.Groups[1].Value)) idx[m.Groups[1].Value] = f;
+                    }
+                }
+                catch { }
+            }
+            return idx;
+        }
+    }
+
+    class PdfExportForm : Form
+    {
+        readonly Settings cfg;
+        readonly SageWorker sage;
+        readonly Action<string> log;
+        readonly ComboBox cboMonth;
+        readonly NumericUpDown numYear;
+        readonly CheckBox chkFac, chkAvo;
+        readonly TextBox txtRoot, txtModel;
+        readonly Button btnSearch, btnExport, btnStop, btnOpenDir, btnClose;
+        readonly Label lblStep, lblSummary;
+        readonly ProgressBar bar;
+        readonly ListView list;
+        List<PdfPiece> pieces = new List<PdfPiece>();
+        readonly Dictionary<PdfPiece, ListViewItem> rows = new Dictionary<PdfPiece, ListViewItem>();
+        volatile bool running, stop, closing;
+        int curYear, curMonth;
+
+        public PdfExportForm(Settings settings, SageWorker worker, Action<string> logger)
+        {
+            cfg = settings; sage = worker; log = logger;
+            Text = "Enregistrer les factures en PDF";
+            Font = new Font("Segoe UI", 9.5f);
+            Icon = Program.AppIcon;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            MinimizeBox = false;
+            Size = new Size(Ui2.Px(1000), Ui2.Px(620));
+
+            var top = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(Ui2.Px(10)) };
+            var row1 = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            cboMonth = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = Ui2.Px(120) };
+            cboMonth.Items.AddRange(RecapFolders.Mois);
+            cboMonth.SelectedIndex = DateTime.Today.Month - 1;
+            numYear = new NumericUpDown { Minimum = 2000, Maximum = 2100, Value = DateTime.Today.Year, Width = Ui2.Px(70) };
+            chkFac = new CheckBox { Text = "Factures", Checked = true, AutoSize = true, Margin = new Padding(Ui2.Px(14), Ui2.Px(5), 0, 0) };
+            chkAvo = new CheckBox { Text = "Avoirs", Checked = true, AutoSize = true, Margin = new Padding(Ui2.Px(6), Ui2.Px(5), 0, 0) };
+            btnSearch = new Button { Text = "Rechercher", AutoSize = true, Margin = new Padding(Ui2.Px(14), 0, 0, 0) };
+            btnSearch.Click += delegate { Search(); };
+            row1.Controls.Add(new Label { Text = "Mois :", AutoSize = true, Margin = new Padding(0, Ui2.Px(6), Ui2.Px(4), 0) });
+            row1.Controls.Add(cboMonth);
+            row1.Controls.Add(new Label { Text = "Année :", AutoSize = true, Margin = new Padding(Ui2.Px(12), Ui2.Px(6), Ui2.Px(4), 0) });
+            row1.Controls.Add(numYear);
+            row1.Controls.Add(chkFac); row1.Controls.Add(chkAvo); row1.Controls.Add(btnSearch);
+
+            var row2 = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, Ui2.Px(6), 0, 0) };
+            txtRoot = new TextBox { Text = cfg.RecapDir, Width = Ui2.Px(420) };
+            var browse = new Button { Text = "Choisir…", AutoSize = true };
+            browse.Click += delegate { ChooseRoot(); };
+            txtModel = new TextBox { Text = cfg.PdfModel, Width = Ui2.Px(170) };
+            row2.Controls.Add(new Label { Text = "Dossier :", AutoSize = true, Margin = new Padding(0, Ui2.Px(6), Ui2.Px(4), 0) });
+            row2.Controls.Add(txtRoot); row2.Controls.Add(browse);
+            row2.Controls.Add(new Label { Text = "Modèle Sage :", AutoSize = true, Margin = new Padding(Ui2.Px(12), Ui2.Px(6), Ui2.Px(4), 0) });
+            row2.Controls.Add(txtModel);
+
+            lblStep = new Label { AutoSize = true, Text = "Choisissez le mois puis « Rechercher ».", Margin = new Padding(3, Ui2.Px(8), 3, Ui2.Px(4)) };
+            bar = new ProgressBar { Dock = DockStyle.Top, Height = Ui2.Px(18), Minimum = 0, Maximum = 100 };
+            top.Controls.Add(row1); top.Controls.Add(row2); top.Controls.Add(lblStep); top.Controls.Add(bar);
+
+            list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false };
+            string[] cols = { "Pièce", "Type", "Date", "Client", "Total TTC", "État", "Fichier" };
+            int[] widths = { 105, 65, 85, 190, 80, 150, 420 };
+            for (int i = 0; i < cols.Length; i++) list.Columns.Add(cols[i], Ui2.Px(widths[i]));
+            list.DoubleClick += delegate
+            {
+                if (list.SelectedItems.Count == 0) return;
+                var p = (PdfPiece)list.SelectedItems[0].Tag;
+                string f = p.Existing.Length > 0 ? p.Existing : p.Target;
+                if (File.Exists(f)) { try { Process.Start(f); } catch { } }
+            };
+
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Ui2.Px(8)) };
+            btnClose = new Button { Text = "Fermer", AutoSize = true };
+            btnClose.Click += delegate { Close(); };
+            btnOpenDir = new Button { Text = "Ouvrir le dossier", AutoSize = true, Enabled = false };
+            btnOpenDir.Click += delegate { OpenMonthDir(); };
+            btnStop = new Button { Text = "Arrêter", AutoSize = true, Enabled = false };
+            btnStop.Click += delegate { stop = true; btnStop.Enabled = false; lblStep.Text = "Arrêt après la pièce en cours…"; };
+            btnExport = new Button { Text = "Enregistrer les PDF manquants", AutoSize = true, Enabled = false, Font = new Font("Segoe UI Semibold", 9.5f) };
+            btnExport.Click += delegate { StartExport(); };
+            lblSummary = new Label { AutoSize = true, Margin = new Padding(3, Ui2.Px(7), Ui2.Px(20), 3) };
+            bottom.Controls.Add(btnClose); bottom.Controls.Add(btnOpenDir); bottom.Controls.Add(btnStop); bottom.Controls.Add(btnExport); bottom.Controls.Add(lblSummary);
+
+            Controls.Add(list); Controls.Add(top); Controls.Add(bottom);
+            AcceptButton = btnSearch;
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (running && e.CloseReason == CloseReason.UserClosing)
+                {
+                    MessageBox.Show(this, "L'enregistrement est en cours : cliquez sur « Arrêter » et attendez la fin de la pièce en cours.", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    e.Cancel = true; return;
+                }
+                closing = true;
+            };
+            // Aucun dossier imposé : au premier usage, on demande où enregistrer les factures (retenu ensuite).
+            Shown += delegate
+            {
+                if (txtRoot.Text.Trim().Length == 0)
+                {
+                    lblStep.Text = "Choisissez d'abord le dossier où enregistrer les factures (bouton « Choisir… »).";
+                    ChooseRoot();
+                }
+            };
+        }
+
+        // Dossier racine des factures (ex. Bureau\Recap) : choisi par l'utilisateur, enregistré dans les réglages.
+        bool ChooseRoot()
+        {
+            using (var dlg = new FolderBrowserDialog { Description = "Dans quel dossier enregistrer les factures ? (les sous-dossiers année / mois / Facture y seront créés)", ShowNewFolderButton = true })
+            {
+                if (Directory.Exists(txtRoot.Text.Trim())) dlg.SelectedPath = txtRoot.Text.Trim();
+                if (dlg.ShowDialog(this) != DialogResult.OK) return false;
+                txtRoot.Text = dlg.SelectedPath;
+            }
+            cfg.RecapDir = txtRoot.Text.Trim();
+            try { cfg.Save(); } catch { }
+            lblStep.Text = "Choisissez le mois puis « Rechercher ».";
+            return true;
+        }
+
+        void Ui(Action a)
+        {
+            if (IsDisposed || closing) return;
+            try { BeginInvoke(a); } catch { }
+        }
+
+        void SetBusy(bool b)
+        {
+            running = b;
+            btnSearch.Enabled = !b; btnExport.Enabled = !b && Missing().Count > 0; btnStop.Enabled = b;
+            cboMonth.Enabled = numYear.Enabled = chkFac.Enabled = chkAvo.Enabled = txtRoot.Enabled = txtModel.Enabled = !b;
+        }
+
+        List<PdfPiece> Missing()
+        {
+            var m = new List<PdfPiece>();
+            foreach (PdfPiece p in pieces) if (p.Existing.Length == 0 && p.Status != "ok") m.Add(p);
+            return m;
+        }
+
+        void SaveChoices()
+        {
+            cfg.RecapDir = txtRoot.Text.Trim();
+            if (txtModel.Text.Trim().Length > 0) cfg.PdfModel = txtModel.Text.Trim();
+            try { cfg.Save(); } catch { }
+        }
+
+        void Search()
+        {
+            if (txtRoot.Text.Trim().Length == 0 && !ChooseRoot()) return;
+            if (!Directory.Exists(txtRoot.Text.Trim()))
+            {
+                MessageBox.Show(this, "Le dossier « " + txtRoot.Text.Trim() + " » n'existe pas. Choisissez le dossier où enregistrer les factures.", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ChooseRoot();
+                return;
+            }
+            if (!chkFac.Checked && !chkAvo.Checked) { MessageBox.Show(this, "Cochez « Factures » et/ou « Avoirs ».", "SageBridge"); return; }
+            SaveChoices();
+            curYear = (int)numYear.Value; curMonth = cboMonth.SelectedIndex + 1;
+            bool fac = chkFac.Checked, avo = chkAvo.Checked;
+            string root = cfg.RecapRoot;
+            list.Items.Clear(); rows.Clear(); pieces = new List<PdfPiece>();
+            lblSummary.Text = ""; btnOpenDir.Enabled = false;
+            SetBusy(true);
+            lblStep.Text = "Lecture des pièces de " + RecapFolders.Mois[curMonth - 1].ToLowerInvariant() + " " + curYear + " dans Sage…";
+            bar.Style = ProgressBarStyle.Marquee;
+            var th = new Thread(delegate()
+            {
+                try
+                {
+                    List<PdfPiece> all = sage.ListPiecesForMonth(curYear, curMonth);
+                    Dictionary<string, string> idx = RecapFolders.IndexExisting(root);
+                    string monthDir = RecapFolders.MonthDir(root, curYear, curMonth, false);
+                    var sel = new List<PdfPiece>();
+                    foreach (PdfPiece p in all)
+                    {
+                        if ((p.Kind == "facture" && !fac) || (p.Kind == "avoir" && !avo)) continue;
+                        string ex; p.Existing = idx.TryGetValue(p.Num, out ex) ? ex : "";
+                        p.Target = Path.Combine(RecapFolders.TypeDir(monthDir, p.Kind, false), p.Num + ".pdf");
+                        sel.Add(p);
+                    }
+                    Ui(delegate
+                    {
+                        pieces = sel;
+                        foreach (PdfPiece p in sel) AddRow(p);
+                        bar.Style = ProgressBarStyle.Blocks; bar.Value = 0;
+                        int miss = Missing().Count;
+                        lblStep.Text = sel.Count == 0 ? "Aucune facture ni avoir validé à cette date dans Sage."
+                            : sel.Count + " pièce(s) validée(s) : " + (sel.Count - miss) + " déjà enregistrée(s), " + miss + " manquante(s).";
+                        btnOpenDir.Enabled = true;
+                        SetBusy(false);
+                        if (miss > 0) btnExport.Text = "Enregistrer les " + miss + " PDF manquants";
+                    });
+                }
+                catch (Exception e)
+                {
+                    log("Export PDF : " + e.Message);
+                    Ui(delegate { bar.Style = ProgressBarStyle.Blocks; lblStep.Text = "Erreur : " + e.Message; SetBusy(false); });
+                }
+            }) { IsBackground = true };
+            th.Start();
+        }
+
+        void AddRow(PdfPiece p)
+        {
+            var it = new ListViewItem(new[] { p.Num, p.Kind == "avoir" ? "Avoir" : "Facture", p.Date.ToString("dd/MM/yyyy"), p.Nom,
+                p.TotalTTC.ToString("0.00", CultureInfo.GetCultureInfo("fr-FR")), "", "" });
+            it.Tag = p;
+            rows[p] = it;
+            list.Items.Add(it);
+            RefreshRow(p);
+        }
+
+        void RefreshRow(PdfPiece p)
+        {
+            ListViewItem it;
+            if (!rows.TryGetValue(p, out it)) return;
+            if (p.Existing.Length > 0) { it.SubItems[5].Text = "Déjà enregistrée"; it.SubItems[6].Text = p.Existing; it.ForeColor = Color.DimGray; }
+            else if (p.Status == "ok") { it.SubItems[5].Text = "Enregistrée"; it.SubItems[6].Text = p.Target; it.ForeColor = Color.DarkGreen; }
+            else if (p.Status == "err") { it.SubItems[5].Text = "Erreur"; it.SubItems[6].Text = p.Error; it.ForeColor = Color.Firebrick; }
+            else if (p.Status == "run") { it.SubItems[5].Text = "En cours…"; it.SubItems[6].Text = p.Target; it.ForeColor = Color.RoyalBlue; it.EnsureVisible(); }
+            else { it.SubItems[5].Text = "Manquante"; it.SubItems[6].Text = p.Target; it.ForeColor = Color.Black; }
+        }
+
+        void OpenMonthDir()
+        {
+            string d = RecapFolders.MonthDir(cfg.RecapRoot, curYear, curMonth, false);
+            if (!Directory.Exists(d)) d = Path.GetDirectoryName(d);
+            if (!Directory.Exists(d)) d = cfg.RecapRoot;
+            try { Process.Start("explorer.exe", "\"" + d + "\""); } catch { }
+        }
+
+        void StartExport()
+        {
+            List<PdfPiece> todo = Missing();
+            if (todo.Count == 0) return;
+            if (!SageWorker.SageWindowOpen()) { MessageBox.Show(this, "Ouvrez d'abord Sage 50.", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            if (MessageBox.Show(this, todo.Count + " PDF vont être créés au modèle « " + cfg.PdfModel + " » dans :\n" +
+                RecapFolders.MonthDir(cfg.RecapRoot, curYear, curMonth, false) + "\n\n" +
+                "Pendant l'enregistrement (2 à 3 s par pièce), n'utilisez pas Sage : ses aperçus vont s'ouvrir et se fermer tout seuls.\n" +
+                "Fermez aussi toute fenêtre ouverte dans Sage (fiche, saisie, aperçu).\n\nContinuer ?",
+                "Enregistrer les PDF", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            string model = cfg.PdfModel, root = cfg.RecapRoot;
+            int year = curYear, month = curMonth;
+            stop = false;
+            SetBusy(true);
+            bar.Maximum = todo.Count; bar.Value = 0;
+            log("Export PDF de " + todo.Count + " pièce(s) de " + month.ToString("00") + "/" + year + " (modèle « " + model + " »).");
+            var th = new Thread(delegate()
+            {
+                int ok = 0, ko = 0, consecutive = 0;
+                for (int i = 0; i < todo.Count; i++)
+                {
+                    if (stop || closing) break;
+                    PdfPiece p = todo[i];
+                    int n = i;
+                    p.Status = "run";
+                    Ui(delegate { lblStep.Text = "Enregistrement " + (n + 1) + " / " + todo.Count + " : " + p.Num + " — " + p.Nom; RefreshRow(p); });
+                    try
+                    {
+                        string dir = RecapFolders.TypeDir(RecapFolders.MonthDir(root, year, month, true), p.Kind, true);
+                        p.Target = Path.Combine(dir, p.Num + ".pdf");
+                        if (File.Exists(p.Target)) { p.Existing = p.Target; p.Status = ""; }
+                        else
+                        {
+                            SagePdfExporter.Export(sage, p, model, p.Target);
+                            p.Status = "ok"; ok++; consecutive = 0;
+                            log("PDF enregistré : " + p.Target);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        p.Status = "err"; p.Error = e.Message; ko++; consecutive++;
+                        log("PDF de " + p.Num + " : " + e.Message);
+                    }
+                    Ui(delegate { RefreshRow(p); bar.Value = Math.Min(bar.Maximum, n + 1); });
+                    if (consecutive >= 3) { log("Export PDF interrompu après 3 erreurs de suite."); break; }
+                }
+                bool interrupted = consecutive >= 3;
+                Ui(delegate
+                {
+                    SetBusy(false);
+                    int miss = Missing().Count;
+                    btnExport.Text = miss > 0 ? "Enregistrer les " + miss + " PDF manquants" : "Enregistrer les PDF manquants";
+                    lblStep.Text = (interrupted ? "Interrompu après 3 erreurs de suite. " : (stop ? "Arrêté. " : "Terminé. ")) + ok + " PDF enregistré(s)" + (ko > 0 ? ", " + ko + " erreur(s)" : "") + ".";
+                    lblSummary.Text = miss > 0 ? miss + " encore manquante(s)" : "Toutes les pièces du mois sont enregistrées.";
+                });
+            }) { IsBackground = true };
+            th.Start();
         }
     }
 
