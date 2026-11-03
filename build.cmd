@@ -14,11 +14,12 @@ if not exist bin mkdir bin
 set LOG=%~dp0build.log
 echo Compilation du %date% %time% avec %CSC% > "%LOG%"
 set REFS=/r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:Microsoft.CSharp.dll
+set APPREFS=/r:System.Web.Extensions.dll /r:System.Xml.dll /r:System.Xml.Linq.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll
 set OPTS=/nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 /win32icon:logo\SageBridge.ico /win32manifest:app.manifest
 
 echo [1/3] SageBridge.exe
 echo [1/3] SageBridge.exe >> "%LOG%"
-"%CSC%" %OPTS% /out:bin\SageBridge.exe %REFS% /r:System.Web.Extensions.dll SageBridge.cs >> "%LOG%" 2>&1
+"%CSC%" %OPTS% /out:bin\SageBridge.exe %REFS% %APPREFS% SageBridge.cs >> "%LOG%" 2>&1
 if errorlevel 1 goto :echec
 
 for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "$v=[Reflection.AssemblyName]::GetAssemblyName('%~dp0bin\SageBridge.exe').Version; '{0}.{1}.{2}' -f $v.Major,$v.Minor,$v.Build"`) do set VER=%%v
