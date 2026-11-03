@@ -1,5 +1,17 @@
 # Historique des versions
 
+## 1.3.9 — 03/11/2026
+
+- **Rapprochement des rapports de paiement** (nouveau bouton « Rapport de paiement… ») : on choisit l'export Excel des paiements Paris Fashion Shop (`Payment_Export_….xlsx`), SageBridge le lit ligne par ligne et retrouve la facture Sage de chaque paiement, avec une barre de progression. Il produit à côté du fichier une copie « … - rapproché.xlsx » avec 6 colonnes en plus : Rapprochement (Trouvée en vert, À vérifier en jaune, Introuvable en rouge, Déjà soldée en gris), N° facture Sage, Client Sage, HT facture Sage, Écart HT, Remarque. **Rien n'est modifié dans Sage** (lecture seule).
+  - Règle : facture **validée**, **non soldée**, au **même nom** (Société de la facture ou nom du client, sans accents ni forme juridique) et au **même total HT** que le « Montant validé HT » du rapport (à 1 centime près). La commission PFS n'entre pas en compte. Si le n° de commande figure dans l'historique de SageBridge, la facture de cette commande est prise en priorité.
+  - Les factures provisoires sont ignorées et les factures soldées ne sont pas retraitées (signalées « Déjà soldée »).
+  - Si rien ne correspond, la remarque liste les autres factures non soldées à ce nom (avec l'écart), les avoirs non soldés, une facture égale au montant **commandé** (avoir à faire ?), une combinaison facture − avoir égale au montant validé, ou une facture du même montant sous un autre nom.
+  - Testé sur l'export du 03/11/2026 (53 lignes) : 52 trouvées, 1 à vérifier (facture au montant commandé, avoir de 3,80 € HT à faire).
+- **Marquer les factures trouvées en soldé** : à la fin du rapprochement, un bouton enregistre dans Sage un **règlement client par facture « Trouvée »** (moteur COM `WgcEngRegCli`) : mode de paiement `VIR`, date du jour, montant = reste dû TTC, référence = n° de commande. Confirmation demandée avant ; les factures sont relues juste avant (une facture soldée, devenue provisoire ou dont le HT a changé entre-temps est ignorée) ; arrêt après 3 erreurs de suite ; vérification finale que le statut Sage est bien « Soldé ». Le fichier « … - rapproché.xlsx » est réécrit avec une colonne « Règlement Sage » (n° du règlement ou motif). Les lignes À vérifier / Introuvable / Déjà soldée ne sont jamais touchées. Testé le 03/11/2026 sur une facture réelle : règlement créé, statut passé à « Soldé ».
+- Nouvelle route `POST /solder` `{ facture, client, montant, reference, simulation }` : **simulation par défaut** (seul `"simulation": false` enregistre).
+- Nouvelle route `GET /factures` (lecture seule) : pièces clients non soldées (`?tout=1` pour toutes) avec n°, type, client, société, totaux, solde dû, validée, soldée, statut.
+- Compilation : références `System.Xml`, `System.Xml.Linq`, `System.IO.Compression` ajoutées dans `build.cmd`.
+
 ## 1.3.8 — 02/11/2026
 
 - **Rafales de factures** : plus de risque de facture « fantôme » créée dans Sage sans trace côté SageBridge quand plusieurs commandes sont envoyées coup sur coup.
