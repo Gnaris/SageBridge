@@ -1,5 +1,15 @@
 # Historique des versions
 
+## 1.4.0 — 03/11/2026
+
+- **Enregistrer les factures en PDF** (nouveau bouton « Enregistrer les PDF… ») : on choisit le **mois** et l'**année**, SageBridge liste les factures et avoirs **validés** de ce mois dans Sage et indique pour chacun s'il est déjà enregistré dans le dossier des factures ou s'il manque. Ce dossier est **choisi par l'utilisateur** au premier usage (bouton « Choisir… », retenu ensuite ; aucun dossier imposé). Le bouton « Enregistrer les PDF manquants » crée ceux qui manquent, au modèle **« Format A4 Complet »** (modifiable), exactement comme à la main (Aperçu > Exporter en PDF > Exporter tout en PDF).
+  - Rangement : `Recap\<année>\<n°>. <Mois>\Facture\<numéro>.pdf` (avoirs dans `Avoir`). Les dossiers manquants sont créés (« 2028 » puis « 11. Novembre » puis « Facture ») ; un dossier existant est réutilisé tel quel (« Novembre » comme « 11. Novembre », « Facture » comme « Factures »).
+  - Fichier nommé par le **numéro de la pièce** (`FA10005913.pdf`, `AV10000115.pdf`). Une pièce est considérée comme déjà enregistrée si un PDF commençant par son numéro existe **n'importe où** sous le dossier des factures (fichiers renommés « FA10005662 Reçu le 06-10-2026.pdf » ou déplacés compris). **Aucun fichier n'est jamais écrasé.**
+  - Les factures provisoires sont ignorées (leur numéro n'est pas définitif).
+  - Pendant l'enregistrement (≈ 3 s par pièce), les aperçus de Sage s'ouvrent et se ferment tout seuls : ne pas utiliser Sage. Bouton « Arrêter » ; arrêt automatique après 3 erreurs de suite.
+  - Technique : Sage n'offre pas d'export PDF par COM (destination « Ficher PDF » de la tâche d'impression → « Paramètres incorrects »). SageBridge ouvre l'aperçu par la tâche COM d'impression (sélection de la pièce, modèle, destination « Ecran »), puis pilote l'aperçu par messages Windows (sans toucher à la souris ni au clavier). Testé le 03/11/2026 : PDF identiques à l'octet près à l'export manuel (FA10005913), avoir AV10000115 correct.
+- Réglages `recap` (dossier des factures, vide tant qu’il n’a pas été choisi) et `modele_pdf` dans `settings.ini`, modifiables depuis la fenêtre.
+
 ## 1.3.10 — 03/11/2026
 
 - **« Marquer en soldé » : on choisit le mode de paiement.** En 1.3.9, chaque règlement était enregistré d'office en mode `VIR`. Désormais, avant de solder, une fenêtre propose la **liste des modes de paiement du dossier Sage** (table « Modes de paiement » : CB, VIR, PFS…) et l'utilisateur choisit celui des règlements. Le mode inscrit sur la plupart des factures concernées est présélectionné ; rien n'est enregistré sans choix. Le mode retenu figure dans la colonne « Règlement Sage » et dans le journal.
