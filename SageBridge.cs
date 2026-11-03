@@ -34,8 +34,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.9.0")]
-[assembly: AssemblyFileVersion("1.3.9.0")]
+[assembly: AssemblyVersion("1.3.10.0")]
+[assembly: AssemblyFileVersion("1.3.10.0")]
 
 namespace SageBridge
 {
@@ -286,7 +286,7 @@ namespace SageBridge
     class SolderResult
     {
         public bool Ok, Simulated;
-        public string Numero = "", Error = "";
+        public string Numero = "", Error = "", Mode = "";
         public double Ecart, TotalFac;
         public int Lignes;
         public List<string> Messages = new List<string>();
@@ -295,7 +295,7 @@ namespace SageBridge
     // Pièce client lue dans la table PieceHCli (lecture seule).
     class PieceRow
     {
-        public string Num = "", Type = "", TypePiece = "", Date = "", Client = "", Societe = "", CliName = "", Statut = "";
+        public string Num = "", Type = "", TypePiece = "", Date = "", Client = "", Societe = "", CliName = "", Statut = "", ModeRglt = "";
         public double TotalHT, TotalTTC, SoldeDu, MtRegle;
         public bool Valide, Soldee;
 
@@ -1192,7 +1192,7 @@ namespace SageBridge
         static readonly Dictionary<string, int> PieceFieldDefaults = new Dictionary<string, int> {
             { "Type", 2 }, { "TypePiece", 3 }, { "Num", 4 }, { "DtPiece", 5 }, { "TotalHT", 22 }, { "TotalTTC", 24 },
             { "SoldeDu", 25 }, { "Client", 36 }, { "Societe", 37 }, { "MtRegle", 54 }, { "Valide", 56 }, { "Solde", 57 },
-            { "CliName", 125 }, { "Statut", 160 }
+            { "CliName", 125 }, { "Statut", 160 }, { "ModeRglt", 50 }
         };
 
         // Toutes les pièces clients. Les pièces soldées ne sont lues qu'en partie (n°, nom, HT) :
@@ -1269,6 +1269,7 @@ namespace SageBridge
                         p.CliName = ValStr(t, f["CliName"]);
                         p.TotalHT = ValNum(t, f["TotalHT"]);
                         p.Soldee = ValBool(t, f["Solde"]);
+                        p.ModeRglt = ValStr(t, f["ModeRglt"]);
                         if (!p.Soldee)
                         {
                             p.Type = ValStr(t, f["Type"]);
@@ -1291,15 +1292,60 @@ namespace SageBridge
             return outp;
         }
 
+        // ── Modes de paiement (table Mop, kCtaTableIdMop = 105003, vérifiée live le 03/11/2026) ──
+        public const int TBL_MODES_PAIEMENT = 105003;
+
+        // [code, intitulé] de chaque mode de paiement du dossier.
+        public List<string[]> ListModes()
+        {
+            return Run<List<string[]>>(delegate
+            {
+                EnsureOpen();
+                var outp = new List<string[]>();
+                dynamic t = doc.OpenTable(TBL_MODES_PAIEMENT);
+                try
+                {
+                    string tname = "";
+                    try { tname = (string)t.TableName; } catch { }
+                    if (!string.Equals(tname, "Mop", StringComparison.OrdinalIgnoreCase))
+                        throw new Exception("La table des modes de paiement n'a pas été trouvée (table « " + tname + " » à la place).");
+                    int fCode = 1, fIntit = 2;
+                    try
+                    {
+                        dynamic coll = t.Fields;
+                        int n = (int)coll.Count;
+                        for (int i = 1; i <= n; i++)
+                        {
+                            try { dynamic fd = coll.Item(i); string nm = (string)fd.Name; if (nm == "Code") fCode = (int)fd.Id; else if (nm == "Intit") fIntit = (int)fd.Id; } catch { }
+                        }
+                    }
+                    catch { }
+                    bool more = false;
+                    try { more = (bool)t.First(); } catch { }
+                    int safety = 10000;
+                    while (more && safety-- > 0)
+                    {
+                        string code = ValStr(t, fCode);
+                        string intit = ValStr(t, fIntit);
+                        if (code.Length > 0) outp.Add(new string[] { code, intit });
+                        try { more = (bool)t.Next(); } catch { break; }
+                    }
+                }
+                finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
+                return outp;
+            });
+        }
+
         // ── Règlement client : solde une facture ──
         // Moteur WgcEngRegCli (eEngineIds.kWgcEngIdRegCli = 97003). Un règlement par facture, du montant
-        // restant dû (TTC), mode « VIR » (code usuel des règlements par virement), date du jour.
+        // restant dû (TTC), date du jour. Mode de paiement = celui CHOISI PAR L'UTILISATEUR dans la liste
+        // des modes du dossier (table Mop) juste avant de solder (demande de Boris, 03/11/2026) :
+        // SageBridge n'en impose aucun.
         // simulate = tout sauf Save. Pas de nouvelle tentative automatique : un Save réussi suivi d'une
         // erreur de lecture ne doit pas produire un second règlement.
         public const int ENG_REGLEMENT_CLI = 97003;
-        public const string MODE_REGLEMENT = "VIR";
 
-        public SolderResult SolderFacture(string numFacture, string clientCode, double montant, string reference, bool simulate)
+        public SolderResult SolderFacture(string numFacture, string clientCode, double montant, string reference, string mode, bool simulate)
         {
             return Run<SolderResult>(delegate
             {
@@ -1312,7 +1358,7 @@ namespace SageBridge
                     if (!(bool)reg.Create()) throw new Exception("Sage n'a pas pu créer le règlement.");
                     reg.Tiers = clientCode;
                     reg.Date = DateTime.Today;
-                    reg.ModePayment = MODE_REGLEMENT;
+                    if (!string.IsNullOrEmpty(mode)) reg.ModePayment = mode;
                     if (!string.IsNullOrEmpty(reference)) { try { reg.reference = reference; } catch (Exception e) { res.Messages.Add("Référence non enregistrée : " + ComMessage(e)); } }
                     reg.Montant = montant;
                     // N° d'échéance : 1 refusé par Sage 50 v6.71 (« Impossible de lire l'échéance '1' ») → 0 d'abord, puis 1.
@@ -1328,6 +1374,7 @@ namespace SageBridge
                     try { res.Ecart = (double)reg.Ecart; } catch { }
                     try { res.TotalFac = (double)reg.TotalFac; } catch { }
                     try { res.Lignes = (int)reg.LineNb; } catch { }
+                    try { res.Mode = (string)reg.ModePayment ?? ""; } catch { }
                     if (Math.Abs(res.Ecart) > 0.005)
                         throw new Exception("Écart de règlement de " + res.Ecart.ToString("0.00") + " € sur " + numFacture + " : rien n'est enregistré.");
                     if (simulate) { res.Ok = true; res.Simulated = true; return res; }
@@ -1335,7 +1382,7 @@ namespace SageBridge
                     try { int total = (int)verif.Total; for (int k = 1; k <= total; k++) { try { res.Messages.Add((string)verif.Desc(k)); } catch { } } } catch { }
                     if (!saved) throw new Exception("Sage a refusé le règlement : " + string.Join(" / ", res.Messages.ToArray()));
                     res.Ok = true;
-                    Log("Règlement " + res.Numero + " enregistré : facture " + numFacture + " (client " + clientCode + ") soldée, " + montant.ToString("0.00") + " € " + MODE_REGLEMENT + (string.IsNullOrEmpty(reference) ? "" : ", réf. " + reference) + ".");
+                    Log("Règlement " + res.Numero + " enregistré : facture " + numFacture + " (client " + clientCode + ") soldée, " + montant.ToString("0.00") + " €" + (res.Mode.Length > 0 ? " (" + res.Mode + ")" : "") + (string.IsNullOrEmpty(reference) ? "" : ", réf. " + reference) + ".");
                     return res;
                 }
                 finally
@@ -1902,7 +1949,8 @@ namespace SageBridge
         public Func<List<Dictionary<string, object>>> OnClients;
         public Func<List<Dictionary<string, object>>> OnArticles;
         public Func<List<PieceRow>> OnPieces;
-        public Func<string, string, double, string, bool, SolderResult> OnSolder;
+        public Func<List<string[]>> OnModes;
+        public Func<string, string, double, string, string, bool, SolderResult> OnSolder;
         HttpListener listener;
         int port;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -2012,11 +2060,17 @@ namespace SageBridge
                         d["numero"] = p.Num; d["type"] = p.Type; d["typePiece"] = p.TypePiece; d["nature"] = p.Kind;
                         d["date"] = p.Date; d["client"] = p.Client; d["societe"] = p.Societe; d["nomClient"] = p.CliName;
                         d["totalHT"] = p.TotalHT; d["totalTTC"] = p.TotalTTC; d["soldeDu"] = p.SoldeDu; d["mtRegle"] = p.MtRegle;
-                        d["validee"] = p.Valide; d["soldee"] = p.Soldee; d["statut"] = p.Statut;
+                        d["validee"] = p.Valide; d["soldee"] = p.Soldee; d["statut"] = p.Statut; d["modeReglement"] = p.ModeRglt;
                         outp.Add(d);
                     }
                     var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                     Send(resp, 200, js.Serialize(outp)); return;
+                }
+                if (path == "/modes" && method == "GET")
+                {
+                    var outp = new List<Dictionary<string, object>>();
+                    foreach (string[] m in OnModes()) outp.Add(new Dictionary<string, object> { { "code", m[0] }, { "intitule", m[1] } });
+                    Send(resp, 200, json.Serialize(outp)); return;
                 }
                 if (path == "/solder" && method == "POST")
                 {
@@ -2028,8 +2082,8 @@ namespace SageBridge
                     var o = new Dictionary<string, object>();
                     try
                     {
-                        SolderResult sr = OnSolder(S(d, "facture"), S(d, "client"), D(d, "montant", 0), S(d, "reference"), simulate);
-                        o["ok"] = sr.Ok; o["simulation"] = sr.Simulated; o["reglement"] = sr.Numero; o["ecart"] = sr.Ecart;
+                        SolderResult sr = OnSolder(S(d, "facture"), S(d, "client"), D(d, "montant", 0), S(d, "reference"), S(d, "mode"), simulate);
+                        o["ok"] = sr.Ok; o["simulation"] = sr.Simulated; o["reglement"] = sr.Numero; o["mode"] = sr.Mode; o["ecart"] = sr.Ecart;
                         o["totalFactures"] = sr.TotalFac; o["lignes"] = sr.Lignes; o["messages"] = sr.Messages;
                         Send(resp, 200, json.Serialize(o));
                     }
@@ -2184,11 +2238,12 @@ namespace SageBridge
             server.OnClients = delegate { return sage.ListClients(); };
             server.OnArticles = delegate { return sage.ListArticles(); };
             server.OnPieces = delegate { return sage.ListPieces(null); };
-            server.OnSolder = delegate(string num, string cli, double mt, string reference, bool sim)
+            server.OnModes = delegate { return sage.ListModes(); };
+            server.OnSolder = delegate(string num, string cli, double mt, string reference, string mode, bool sim)
             {
                 if (updating) throw new Exception("SageBridge installe une mise à jour : réessayez dans une minute.");
                 Interlocked.Increment(ref busy);
-                try { return sage.SolderFacture(num, cli, mt, reference, sim); }
+                try { return sage.SolderFacture(num, cli, mt, reference, mode, sim); }
                 finally { Interlocked.Decrement(ref busy); }
             };
             StartServer();
@@ -3216,6 +3271,8 @@ namespace SageBridge
         int headerRowIndex;
         List<ReportLine> lines;
         bool solderDone;
+        List<PieceRow> pieces0;
+        List<string[]> modes;
 
         public ReconcileForm(string file, SageWorker worker, Func<string, string> hist, Action<string> logger)
         {
@@ -3345,6 +3402,7 @@ namespace SageBridge
                 Step("Lecture des factures dans Sage : " + done + " / " + total, done, total);
             });
             var rec = new PaymentReconciler(pieces, history);
+            pieces0 = pieces;
 
             // 3) Ligne par ligne
             int ok = 0, verif = 0, ko = 0, deja = 0;
@@ -3370,6 +3428,7 @@ namespace SageBridge
             string summary = lines.Count + " lignes : " + ok + " trouvée(s), " + verif + " à vérifier, " + ko + " introuvable(s)" + (deja > 0 ? ", " + deja + " déjà soldée(s)" : "")
                 + " — " + rec.OpenCount + " facture(s) non soldée(s) dans Sage.";
             log("Rapprochement terminé : " + summary + " Fichier : " + outPath);
+            if (ok > 0) { try { modes = sage.ListModes(); } catch (Exception e) { log("Modes de paiement : " + e.Message); } }
             int nTrouvees = ok;
             Ui(delegate
             {
@@ -3428,23 +3487,45 @@ namespace SageBridge
             if (lines == null || solderRunning) return;
             var todo = lines.FindAll(delegate(ReportLine l) { return l.Resultat == PaymentReconciler.TROUVEE && l.Reglement.Length == 0 && l.Numero.Length > 0; });
             if (todo.Count == 0) return;
+            if (modes == null || modes.Count == 0)
+            {
+                try { modes = sage.ListModes(); }
+                catch (Exception e) { MessageBox.Show(this, "Impossible de lire les modes de paiement dans Sage : " + e.Message, "Marquer en soldé", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                if (modes.Count == 0) { MessageBox.Show(this, "Aucun mode de paiement n'est défini dans Sage.", "Marquer en soldé", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            }
+            // Proposé par défaut : le mode le plus fréquent sur les factures à solder (l'utilisateur choisit).
+            var count = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (pieces0 != null)
+                foreach (ReportLine l in todo)
+                {
+                    PieceRow p = pieces0.Find(delegate(PieceRow x) { return string.Equals(x.Num, l.Numero, StringComparison.OrdinalIgnoreCase); });
+                    if (p == null || p.ModeRglt.Length == 0) continue;
+                    int c; count.TryGetValue(p.ModeRglt, out c); count[p.ModeRglt] = c + 1;
+                }
+            string suggested = null; int best = 0;
+            foreach (KeyValuePair<string, int> kv in count) if (kv.Value > best) { best = kv.Value; suggested = kv.Key; }
             string exemple = todo[0].Order.Length > 0 ? " (ex. " + todo[0].Order + ")" : "";
             string msg = todo.Count + " facture(s) « Trouvée » vont être marquées SOLDÉES dans Sage.\n\n"
                 + "Pour chacune, SageBridge enregistre un règlement client :\n"
-                + "   • mode de paiement " + SageWorker.MODE_REGLEMENT + " (virement)\n"
                 + "   • date du jour (" + DateTime.Today.ToString("dd/MM/yyyy") + ")\n"
                 + "   • montant = reste dû TTC de la facture\n"
-                + "   • référence = n° de commande" + exemple + "\n\n"
-                + "Les lignes « À vérifier », « Introuvable » et « Déjà soldée » ne sont pas touchées.\n"
-                + "Un règlement peut se supprimer ensuite dans Sage si besoin.\n\nContinuer ?";
-            if (MessageBox.Show(this, msg, "Marquer en soldé", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                + "   • référence = n° de commande" + exemple + "\n"
+                + "   • mode de paiement choisi ci-dessous (le même pour toutes)\n\n"
+                + "Les lignes « À vérifier », « Introuvable » et « Déjà soldée » ne sont pas touchées.";
+            string mode;
+            using (var dlg = new SolderDialog(msg, modes, suggested))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                mode = dlg.Mode;
+            }
+            if (string.IsNullOrEmpty(mode)) return;
             solderRunning = true;
             btnSolder.Enabled = false; btnClose.Enabled = false;
-            var th = new Thread(delegate() { SolderWork(todo); }) { IsBackground = true };
+            var th = new Thread(delegate() { SolderWork(todo, mode); }) { IsBackground = true };
             th.Start();
         }
 
-        void SolderWork(List<ReportLine> todo)
+        void SolderWork(List<ReportLine> todo, string mode)
         {
             int ok = 0, skip = 0, err = 0, consecutive = 0;
             try
@@ -3454,7 +3535,7 @@ namespace SageBridge
                 List<PieceRow> fresh = sage.ListPieces(delegate(int done, int total) { Step("Relecture des factures dans Sage : " + done + " / " + total, done, total); });
                 var byNum = new Dictionary<string, PieceRow>(StringComparer.OrdinalIgnoreCase);
                 foreach (PieceRow p in fresh) if (p.Kind == "facture" && !byNum.ContainsKey(p.Num)) byNum[p.Num] = p;
-                log("Marquage en soldé : " + todo.Count + " facture(s) à solder.");
+                log("Marquage en soldé : " + todo.Count + " facture(s) à solder, mode de paiement " + mode + ".");
 
                 for (int i = 0; i < todo.Count; i++)
                 {
@@ -3471,8 +3552,8 @@ namespace SageBridge
                         double montant = Math.Round(p.SoldeDu, 2);
                         try
                         {
-                            SolderResult r = sage.SolderFacture(p.Num, p.Client, montant, l.Order, false);
-                            l.Reglement = "Soldée – règlement " + r.Numero + " de " + Eur(montant);
+                            SolderResult r = sage.SolderFacture(p.Num, p.Client, montant, l.Order, mode, false);
+                            l.Reglement = "Soldée – règlement " + r.Numero + " de " + Eur(montant) + (r.Mode.Length > 0 ? " (" + r.Mode + ")" : "");
                             ok++; consecutive = 0;
                         }
                         catch (Exception e)
@@ -3566,6 +3647,44 @@ namespace SageBridge
             l.Item = it;
             list.Items.Add(it);
             it.EnsureVisible();
+        }
+    }
+
+    // Choix du mode de paiement des règlements, parmi les modes du dossier Sage.
+    class SolderDialog : Form
+    {
+        readonly ComboBox box;
+        readonly List<string[]> modes;
+        public string Mode { get { return box.SelectedIndex >= 0 ? modes[box.SelectedIndex][0] : null; } }
+
+        public SolderDialog(string message, List<string[]> list, string suggested)
+        {
+            modes = list;
+            Ui2.Setup(this, "Marquer en soldé");
+            var g = Ui2.Grid(2);
+            g.Controls.Add(new Label { Text = message, AutoSize = true, MaximumSize = new Size(Ui2.Px(560), 0), Margin = new Padding(3, 3, 3, 12) }, 0, 0);
+            g.SetColumnSpan(g.GetControlFromPosition(0, 0), 2);
+            g.Controls.Add(Ui2.L("Mode de paiement :"), 0, 1);
+            box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = Ui2.Px(300) };
+            foreach (string[] m in list) box.Items.Add(m[0] + (m[1].Length > 0 ? " – " + m[1] : ""));
+            int sel = -1;
+            if (!string.IsNullOrEmpty(suggested))
+                for (int i = 0; i < list.Count; i++) if (string.Equals(list[i][0], suggested, StringComparison.OrdinalIgnoreCase)) sel = i;
+            box.SelectedIndex = sel;   // rien de présélectionné si aucune suggestion : l'utilisateur choisit
+            g.Controls.Add(box, 1, 1);
+            if (!string.IsNullOrEmpty(suggested) && sel >= 0)
+                g.Controls.Add(new Label { Text = "Proposé : le mode inscrit sur la plupart de ces factures.", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 3) }, 1, 2);
+            Controls.Add(g);
+            var buttons = Ui2.OkCancel(this, "Solder les factures");
+            Controls.Add(buttons);
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (DialogResult == DialogResult.OK && box.SelectedIndex < 0)
+                {
+                    MessageBox.Show(this, "Choisissez le mode de paiement.", "Marquer en soldé", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    e.Cancel = true;
+                }
+            };
         }
     }
 
