@@ -18,6 +18,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -33,8 +34,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.3.8.0")]
-[assembly: AssemblyFileVersion("1.3.8.0")]
+[assembly: AssemblyVersion("1.3.9.0")]
+[assembly: AssemblyFileVersion("1.3.9.0")]
 
 namespace SageBridge
 {
@@ -280,6 +281,38 @@ namespace SageBridge
         public int NbLines;
         public double TotalHT, TotalTTC;
         public List<string> Messages = new List<string>();
+    }
+
+    class SolderResult
+    {
+        public bool Ok, Simulated;
+        public string Numero = "", Error = "";
+        public double Ecart, TotalFac;
+        public int Lignes;
+        public List<string> Messages = new List<string>();
+    }
+
+    // Pièce client lue dans la table PieceHCli (lecture seule).
+    class PieceRow
+    {
+        public string Num = "", Type = "", TypePiece = "", Date = "", Client = "", Societe = "", CliName = "", Statut = "";
+        public double TotalHT, TotalTTC, SoldeDu, MtRegle;
+        public bool Valide, Soldee;
+
+        // « facture », « avoir », « acompte » ou « autre », d'après le libellé du type de pièce.
+        public string Kind
+        {
+            get
+            {
+                string t = Norm.Text(TypePiece);
+                if (t.Contains("avoir")) return "avoir";
+                if (t.Contains("acompte")) return "acompte";
+                if (t.Contains("facture")) return "facture";
+                return "autre";
+            }
+        }
+
+        public string NomAffiche { get { return Societe.Length > 0 ? Societe : CliName; } }
     }
 
     // ───────────────────────── Normalisation (sans accents, sans casse) ─────────────────────────
@@ -672,7 +705,9 @@ namespace SageBridge
 
         // ── Exécution sur le thread COM ──
 
-        T Run<T>(Func<T> f)
+        T Run<T>(Func<T> f) { return Run<T>(f, 120000); }
+
+        T Run<T>(Func<T> f, int timeoutMs)
         {
             if (!SageWindowOpen())
                 throw new Exception("Sage 50 n'est pas ouvert sur ce PC : ouvrez Sage" +
@@ -695,10 +730,10 @@ namespace SageBridge
             // permet aux rafales longues de passer tout en évitant un blocage éternel.
             if (!started.WaitOne(900000))
                 throw new Exception("Sage très sollicité : la demande est restée en file plus de 15 minutes. Vérifiez l'état de Sage et réessayez.");
-            if (!done.WaitOne(120000))
+            if (!done.WaitOne(timeoutMs))
             {
                 queue.Add(delegate { Reset(); });
-                throw new Exception("Sage ne répond pas (plus de 2 minutes). Vérifiez qu'aucune fenêtre de Sage n'attend une réponse, puis réessayez.");
+                throw new Exception("Sage ne répond pas (plus de " + (timeoutMs / 60000) + " minutes). Vérifiez qu'aucune fenêtre de Sage n'attend une réponse, puis réessayez.");
             }
             if (error != null) throw error;
             return result;
@@ -1148,6 +1183,167 @@ namespace SageBridge
             }
             finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
             return outp;
+        }
+
+        // ── Pièces clients (factures, avoirs…) — lecture seule ──
+        // Table PieceHCli (kWgcTableIdPieceHCli = 97004), vérifiée live le 03/11/2026 sur Sage 50 v6.71.
+        // Rubriques résolues par nom, avec ces valeurs de secours (eWgcTablePieceHCliFieldIds).
+        public const int TBL_PIECES_CLI = 97004;
+        static readonly Dictionary<string, int> PieceFieldDefaults = new Dictionary<string, int> {
+            { "Type", 2 }, { "TypePiece", 3 }, { "Num", 4 }, { "DtPiece", 5 }, { "TotalHT", 22 }, { "TotalTTC", 24 },
+            { "SoldeDu", 25 }, { "Client", 36 }, { "Societe", 37 }, { "MtRegle", 54 }, { "Valide", 56 }, { "Solde", 57 },
+            { "CliName", 125 }, { "Statut", 160 }
+        };
+
+        // Toutes les pièces clients. Les pièces soldées ne sont lues qu'en partie (n°, nom, HT) :
+        // elles ne servent qu'à signaler « déjà soldée ». Délai porté à 10 min (gros dossiers mobiles).
+        public List<PieceRow> ListPieces(Action<int, int> progress)
+        {
+            return Run<List<PieceRow>>(delegate
+            {
+                try { return ListPiecesInner(progress); }
+                catch (Exception first)
+                {
+                    Log("Échec (" + ComMessage(first) + "), nouvelle tentative après reconnexion…");
+                    Reset();
+                    return ListPiecesInner(progress);
+                }
+            }, 600000);
+        }
+
+        static string ValStr(dynamic t, int fid)
+        {
+            try { object o = t.GetVal(fid); return o == null ? "" : Convert.ToString(o, CultureInfo.InvariantCulture).Trim(); }
+            catch { return ""; }
+        }
+
+        static double ValNum(dynamic t, int fid)
+        {
+            try { object o = t.GetVal(fid); return o == null ? 0 : Convert.ToDouble(o, CultureInfo.InvariantCulture); }
+            catch { return 0; }
+        }
+
+        static bool ValBool(dynamic t, int fid)
+        {
+            string s = ValStr(t, fid).ToLowerInvariant();
+            return s == "1" || s == "true" || s == "-1" || s == "oui";
+        }
+
+        List<PieceRow> ListPiecesInner(Action<int, int> progress)
+        {
+            EnsureOpen();
+            var outp = new List<PieceRow>();
+            dynamic t = doc.OpenTable(TBL_PIECES_CLI);
+            try
+            {
+                string tname = "";
+                try { tname = (string)t.TableName; } catch { }
+                if (!string.Equals(tname, "PieceHCli", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("La table des pièces clients n'a pas été trouvée (table « " + tname + " » à la place) : version de Sage 50 non prise en charge.");
+                var f = new Dictionary<string, int>(PieceFieldDefaults, StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    dynamic coll = t.Fields;
+                    int n = (int)coll.Count;
+                    for (int i = 1; i <= n; i++)
+                    {
+                        try { dynamic fd = coll.Item(i); string nm = (string)fd.Name; if (f.ContainsKey(nm)) f[nm] = (int)fd.Id; } catch { }
+                    }
+                }
+                catch { }
+                int total = 0;
+                try { total = (int)t.NbN; } catch { }
+                bool more = false;
+                try { more = (bool)t.First(); } catch { }
+                int done = 0, safety = 500000;
+                while (more && safety-- > 0)
+                {
+                    done++;
+                    if (progress != null && (done % 25 == 0 || done == total)) progress(done, total);
+                    var p = new PieceRow();
+                    p.Num = ValStr(t, f["Num"]);
+                    if (p.Num.Length > 0)
+                    {
+                        p.TypePiece = ValStr(t, f["TypePiece"]);
+                        p.Societe = ValStr(t, f["Societe"]);
+                        p.CliName = ValStr(t, f["CliName"]);
+                        p.TotalHT = ValNum(t, f["TotalHT"]);
+                        p.Soldee = ValBool(t, f["Solde"]);
+                        if (!p.Soldee)
+                        {
+                            p.Type = ValStr(t, f["Type"]);
+                            p.Date = ValStr(t, f["DtPiece"]);
+                            p.Client = ValStr(t, f["Client"]);
+                            p.TotalTTC = ValNum(t, f["TotalTTC"]);
+                            p.SoldeDu = ValNum(t, f["SoldeDu"]);
+                            p.MtRegle = ValNum(t, f["MtRegle"]);
+                            p.Valide = ValBool(t, f["Valide"]);
+                            p.Statut = ValStr(t, f["Statut"]);
+                        }
+                        else p.Statut = "Soldé";
+                        outp.Add(p);
+                    }
+                    try { more = (bool)t.Next(); } catch { break; }
+                }
+                Log("Pièces clients lues : " + outp.Count + ".");
+            }
+            finally { try { Marshal.FinalReleaseComObject(t); } catch { } }
+            return outp;
+        }
+
+        // ── Règlement client : solde une facture ──
+        // Moteur WgcEngRegCli (eEngineIds.kWgcEngIdRegCli = 97003). Un règlement par facture, du montant
+        // restant dû (TTC), mode « VIR » (code usuel des règlements par virement), date du jour.
+        // simulate = tout sauf Save. Pas de nouvelle tentative automatique : un Save réussi suivi d'une
+        // erreur de lecture ne doit pas produire un second règlement.
+        public const int ENG_REGLEMENT_CLI = 97003;
+        public const string MODE_REGLEMENT = "VIR";
+
+        public SolderResult SolderFacture(string numFacture, string clientCode, double montant, string reference, bool simulate)
+        {
+            return Run<SolderResult>(delegate
+            {
+                EnsureOpen();
+                var res = new SolderResult();
+                dynamic reg = doc.CreateEngine(ENG_REGLEMENT_CLI);
+                dynamic verif = app.CreateVerif();
+                try
+                {
+                    if (!(bool)reg.Create()) throw new Exception("Sage n'a pas pu créer le règlement.");
+                    reg.Tiers = clientCode;
+                    reg.Date = DateTime.Today;
+                    reg.ModePayment = MODE_REGLEMENT;
+                    if (!string.IsNullOrEmpty(reference)) { try { reg.reference = reference; } catch (Exception e) { res.Messages.Add("Référence non enregistrée : " + ComMessage(e)); } }
+                    reg.Montant = montant;
+                    // N° d'échéance : 1 refusé par Sage 50 v6.71 (« Impossible de lire l'échéance '1' ») → 0 d'abord, puis 1.
+                    bool added = false; string addErr = "";
+                    foreach (int eche in new[] { 0, 1 })
+                    {
+                        try { if ((bool)reg.AddFacture(numFacture, eche, montant)) { added = true; break; } }
+                        catch (Exception e) { addErr = ComMessage(e); }
+                    }
+                    if (!added)
+                        throw new Exception("Sage refuse d'imputer le règlement sur la facture " + numFacture + " (client " + clientCode + ")" + (addErr.Length > 0 ? " : " + addErr : "."));
+                    try { res.Numero = (string)reg.Numero; } catch { }
+                    try { res.Ecart = (double)reg.Ecart; } catch { }
+                    try { res.TotalFac = (double)reg.TotalFac; } catch { }
+                    try { res.Lignes = (int)reg.LineNb; } catch { }
+                    if (Math.Abs(res.Ecart) > 0.005)
+                        throw new Exception("Écart de règlement de " + res.Ecart.ToString("0.00") + " € sur " + numFacture + " : rien n'est enregistré.");
+                    if (simulate) { res.Ok = true; res.Simulated = true; return res; }
+                    bool saved = (bool)reg.Save(0, verif);
+                    try { int total = (int)verif.Total; for (int k = 1; k <= total; k++) { try { res.Messages.Add((string)verif.Desc(k)); } catch { } } } catch { }
+                    if (!saved) throw new Exception("Sage a refusé le règlement : " + string.Join(" / ", res.Messages.ToArray()));
+                    res.Ok = true;
+                    Log("Règlement " + res.Numero + " enregistré : facture " + numFacture + " (client " + clientCode + ") soldée, " + montant.ToString("0.00") + " € " + MODE_REGLEMENT + (string.IsNullOrEmpty(reference) ? "" : ", réf. " + reference) + ".");
+                    return res;
+                }
+                finally
+                {
+                    try { Marshal.FinalReleaseComObject(reg); } catch { }
+                    try { Marshal.FinalReleaseComObject(verif); } catch { }
+                }
+            });
         }
 
         // Outil de développement : ouvre une table et liste ses rubriques (GET /diag?id=…&fids=…).
@@ -1656,6 +1852,18 @@ namespace SageBridge
             lock (sync) { string v; return sent.TryGetValue(Key(site, orderNo), out v) ? v : null; }
         }
 
+        // N° de facture créé pour ce n° de commande (tous sites confondus), ou null.
+        public string FindByOrder(string orderNo)
+        {
+            if (string.IsNullOrEmpty(orderNo)) return null;
+            lock (sync)
+            {
+                for (int i = rows.Count - 1; i >= 0; i--)
+                    if (string.Equals(rows[i][2].Trim(), orderNo.Trim(), StringComparison.OrdinalIgnoreCase)) return rows[i][3];
+            }
+            return null;
+        }
+
         public List<string[]> Recent(int max)
         {
             lock (sync)
@@ -1693,6 +1901,8 @@ namespace SageBridge
         public Func<int, int[], Dictionary<string, object>> OnDiag;
         public Func<List<Dictionary<string, object>>> OnClients;
         public Func<List<Dictionary<string, object>>> OnArticles;
+        public Func<List<PieceRow>> OnPieces;
+        public Func<string, string, double, string, bool, SolderResult> OnSolder;
         HttpListener listener;
         int port;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -1789,6 +1999,42 @@ namespace SageBridge
                 if (path == "/articles" && method == "GET")
                 {
                     Send(resp, 200, json.Serialize(OnArticles())); return;
+                }
+                if (path == "/factures" && method == "GET")
+                {
+                    // Lecture seule. Par défaut : pièces non soldées ; ?tout=1 pour toutes.
+                    bool tout = ctx.Request.QueryString["tout"] == "1";
+                    var outp = new List<Dictionary<string, object>>();
+                    foreach (PieceRow p in OnPieces())
+                    {
+                        if (p.Soldee && !tout) continue;
+                        var d = new Dictionary<string, object>();
+                        d["numero"] = p.Num; d["type"] = p.Type; d["typePiece"] = p.TypePiece; d["nature"] = p.Kind;
+                        d["date"] = p.Date; d["client"] = p.Client; d["societe"] = p.Societe; d["nomClient"] = p.CliName;
+                        d["totalHT"] = p.TotalHT; d["totalTTC"] = p.TotalTTC; d["soldeDu"] = p.SoldeDu; d["mtRegle"] = p.MtRegle;
+                        d["validee"] = p.Valide; d["soldee"] = p.Soldee; d["statut"] = p.Statut;
+                        outp.Add(d);
+                    }
+                    var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                    Send(resp, 200, js.Serialize(outp)); return;
+                }
+                if (path == "/solder" && method == "POST")
+                {
+                    // { facture, client, montant, reference, simulation } — simulation par défaut (seul "simulation": false enregistre).
+                    string body;
+                    using (var r = new StreamReader(ctx.Request.InputStream, Encoding.UTF8)) body = r.ReadToEnd();
+                    var d = (Dictionary<string, object>)json.DeserializeObject(body);
+                    object sim; bool simulate = !(d.TryGetValue("simulation", out sim) && sim is bool && !(bool)sim);
+                    var o = new Dictionary<string, object>();
+                    try
+                    {
+                        SolderResult sr = OnSolder(S(d, "facture"), S(d, "client"), D(d, "montant", 0), S(d, "reference"), simulate);
+                        o["ok"] = sr.Ok; o["simulation"] = sr.Simulated; o["reglement"] = sr.Numero; o["ecart"] = sr.Ecart;
+                        o["totalFactures"] = sr.TotalFac; o["lignes"] = sr.Lignes; o["messages"] = sr.Messages;
+                        Send(resp, 200, json.Serialize(o));
+                    }
+                    catch (Exception e) { o["ok"] = false; o["error"] = e.Message; Send(resp, 500, json.Serialize(o)); }
+                    return;
                 }
                 if (path == "/diag" && method == "GET")
                 {
@@ -1937,6 +2183,14 @@ namespace SageBridge
             server.OnDiag = delegate(int id, int[] fids) { return sage.Diag(id, fids); };
             server.OnClients = delegate { return sage.ListClients(); };
             server.OnArticles = delegate { return sage.ListArticles(); };
+            server.OnPieces = delegate { return sage.ListPieces(null); };
+            server.OnSolder = delegate(string num, string cli, double mt, string reference, bool sim)
+            {
+                if (updating) throw new Exception("SageBridge installe une mise à jour : réessayez dans une minute.");
+                Interlocked.Increment(ref busy);
+                try { return sage.SolderFacture(num, cli, mt, reference, sim); }
+                finally { Interlocked.Decrement(ref busy); }
+            };
             StartServer();
 
             showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
@@ -2115,6 +2369,7 @@ namespace SageBridge
             btnTest = MakeButton("Facture de test…", delegate { CreateTestInvoice(); });
             buttons.Controls.Add(btnTest);
             buttons.Controls.Add(MakeButton("Ouvrir Sage 50", delegate { OpenSage(); }));
+            buttons.Controls.Add(MakeButton("Rapport de paiement…", delegate { OpenPaymentReport(); }));
             buttons.Controls.Add(MakeButton("Historique", delegate { OpenFile(Settings.HistoryFile, "Aucune facture n'a encore été créée."); }));
             buttons.Controls.Add(MakeButton("Journal", delegate { OpenFile(Settings.LogFile, "Le journal est vide."); }));
             var btnDoc = MakeButton("Documentation", delegate { OpenFile(Program.DocPath, "La documentation n'est pas installée à côté du programme."); });
@@ -2412,6 +2667,29 @@ namespace SageBridge
             }
         }
 
+        // Rapport de paiement (export PFS .xlsx) : rapproche chaque ligne d'une facture Sage, sans rien modifier dans Sage.
+        void OpenPaymentReport()
+        {
+            if (!SageWorker.SageWindowOpen())
+            {
+                MessageBox.Show(this, "Ouvrez d'abord Sage 50" + (cfg.DossierName.Length > 0 ? " sur le dossier « " + cfg.DossierName + " »" : "") + ".", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string file;
+            using (var dlg = new OpenFileDialog { Title = "Choisir le rapport de paiement (export Excel Paris Fashion Shop)", Filter = "Classeur Excel (*.xlsx)|*.xlsx" })
+            {
+                try { dlg.InitialDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"); } catch { }
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                file = dlg.FileName;
+            }
+            Interlocked.Increment(ref busy);
+            try
+            {
+                using (var f = new ReconcileForm(file, sage, history.FindByOrder, LogLine)) f.ShowDialog(this);
+            }
+            finally { Interlocked.Decrement(ref busy); }
+        }
+
         void OpenSage()
         {
             string exe = SageWorker.SageExePath();
@@ -2472,6 +2750,824 @@ namespace SageBridge
     }
 
     // ───────────────────────── Petites fenêtres ─────────────────────────
+
+    // ───────────────────────── Excel (.xlsx) minimal : lecture + ajout de colonnes ─────────────────────────
+    // Un .xlsx est un zip de fichiers XML. On lit la 1ʳᵉ feuille et on réécrit le même classeur
+    // en ajoutant des colonnes à droite (le reste du fichier est conservé tel quel).
+
+    class XlsxRow
+    {
+        public int Index;                                            // n° de ligne Excel (attribut r)
+        public Dictionary<int, string> Cells = new Dictionary<int, string>(); // colonne (0 = A) → texte
+        public string Get(int col) { string v; return col >= 0 && Cells.TryGetValue(col, out v) ? v : ""; }
+    }
+
+    class XlsxSheet
+    {
+        public string Entry = "";     // chemin de la feuille dans le zip
+        public List<XlsxRow> Rows = new List<XlsxRow>();
+        public int MaxCol = -1;
+    }
+
+    static class Xlsx
+    {
+        public static readonly System.Xml.Linq.XNamespace M = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        static readonly System.Xml.Linq.XNamespace R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        static readonly System.Xml.Linq.XNamespace PR = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+        public static string ColName(int col)
+        {
+            string s = ""; col++;
+            while (col > 0) { int m = (col - 1) % 26; s = (char)('A' + m) + s; col = (col - 1) / 26; }
+            return s;
+        }
+
+        static int ColIndex(string cellRef)
+        {
+            int c = 0;
+            foreach (char ch in cellRef) { if (ch < 'A' || ch > 'Z') break; c = c * 26 + (ch - 'A' + 1); }
+            return c - 1;
+        }
+
+        static System.Xml.Linq.XDocument Load(System.IO.Compression.ZipArchive z, string name)
+        {
+            System.IO.Compression.ZipArchiveEntry e = Find(z, name);
+            if (e == null) return null;
+            using (Stream s = e.Open()) return System.Xml.Linq.XDocument.Load(s);
+        }
+
+        static System.IO.Compression.ZipArchiveEntry Find(System.IO.Compression.ZipArchive z, string name)
+        {
+            foreach (System.IO.Compression.ZipArchiveEntry e in z.Entries)
+                if (string.Equals(e.FullName, name, StringComparison.OrdinalIgnoreCase)) return e;
+            return null;
+        }
+
+        static string FirstSheetEntry(System.IO.Compression.ZipArchive z)
+        {
+            try
+            {
+                var wb = Load(z, "xl/workbook.xml");
+                var rels = Load(z, "xl/_rels/workbook.xml.rels");
+                var sheet = wb.Root.Element(M + "sheets").Element(M + "sheet");
+                string rid = (string)sheet.Attribute(R + "id");
+                foreach (var rel in rels.Root.Elements(PR + "Relationship"))
+                {
+                    if ((string)rel.Attribute("Id") != rid) continue;
+                    string target = ((string)rel.Attribute("Target") ?? "").Replace('\\', '/');
+                    return target.StartsWith("/") ? target.Substring(1) : "xl/" + target;
+                }
+            }
+            catch { }
+            return "xl/worksheets/sheet1.xml";
+        }
+
+        public static XlsxSheet Read(string path)
+        {
+            var sh = new XlsxSheet();
+            using (var z = System.IO.Compression.ZipFile.OpenRead(path))
+            {
+                var shared = new List<string>();
+                var sst = Load(z, "xl/sharedStrings.xml");
+                if (sst != null)
+                    foreach (var si in sst.Root.Elements(M + "si"))
+                    {
+                        var sb = new StringBuilder();
+                        foreach (var t in si.Descendants(M + "t")) sb.Append(t.Value);
+                        shared.Add(sb.ToString());
+                    }
+                sh.Entry = FirstSheetEntry(z);
+                var doc = Load(z, sh.Entry);
+                if (doc == null) throw new Exception("Feuille Excel introuvable dans le fichier.");
+                int auto = 0;
+                foreach (var row in doc.Root.Element(M + "sheetData").Elements(M + "row"))
+                {
+                    var xr = new XlsxRow();
+                    int ri; xr.Index = int.TryParse((string)row.Attribute("r"), out ri) ? ri : auto + 1;
+                    auto = xr.Index;
+                    int nextCol = 0;
+                    foreach (var c in row.Elements(M + "c"))
+                    {
+                        string r = (string)c.Attribute("r");
+                        int col = string.IsNullOrEmpty(r) ? nextCol : ColIndex(r);
+                        nextCol = col + 1;
+                        string type = (string)c.Attribute("t") ?? "";
+                        string val;
+                        if (type == "inlineStr")
+                        {
+                            var sb = new StringBuilder();
+                            foreach (var t in c.Descendants(M + "t")) sb.Append(t.Value);
+                            val = sb.ToString();
+                        }
+                        else
+                        {
+                            var v = c.Element(M + "v");
+                            val = v == null ? "" : v.Value;
+                            int idx;
+                            if (type == "s" && int.TryParse(val, out idx) && idx >= 0 && idx < shared.Count) val = shared[idx];
+                        }
+                        xr.Cells[col] = val;
+                        if (col > sh.MaxCol) sh.MaxCol = col;
+                    }
+                    sh.Rows.Add(xr);
+                }
+            }
+            return sh;
+        }
+
+        // Ajoute styles de remplissage (vert, orange, rouge, gris) ; renvoie les index de style ou null.
+        static int[] AddFillStyles(System.IO.Compression.ZipArchive z)
+        {
+            try
+            {
+                System.IO.Compression.ZipArchiveEntry e = Find(z, "xl/styles.xml");
+                if (e == null) return null;
+                System.Xml.Linq.XDocument st;
+                using (Stream s = e.Open()) st = System.Xml.Linq.XDocument.Load(s);
+                var fills = st.Root.Element(M + "fills");
+                var xfs = st.Root.Element(M + "cellXfs");
+                if (fills == null || xfs == null) return null;
+                string[] colors = { "FFC6EFCE", "FFFFEB9C", "FFFFC7CE", "FFE7E6E6" };
+                var result = new int[colors.Length];
+                for (int i = 0; i < colors.Length; i++)
+                {
+                    int fillId = fills.Elements(M + "fill").Count();
+                    fills.Add(new System.Xml.Linq.XElement(M + "fill",
+                        new System.Xml.Linq.XElement(M + "patternFill", new System.Xml.Linq.XAttribute("patternType", "solid"),
+                            new System.Xml.Linq.XElement(M + "fgColor", new System.Xml.Linq.XAttribute("rgb", colors[i])),
+                            new System.Xml.Linq.XElement(M + "bgColor", new System.Xml.Linq.XAttribute("indexed", "64")))));
+                    result[i] = xfs.Elements(M + "xf").Count();
+                    xfs.Add(new System.Xml.Linq.XElement(M + "xf",
+                        new System.Xml.Linq.XAttribute("numFmtId", "0"), new System.Xml.Linq.XAttribute("fontId", "0"),
+                        new System.Xml.Linq.XAttribute("fillId", fillId), new System.Xml.Linq.XAttribute("borderId", "0"),
+                        new System.Xml.Linq.XAttribute("xfId", "0"), new System.Xml.Linq.XAttribute("applyFill", "1")));
+                }
+                fills.SetAttributeValue("count", fills.Elements(M + "fill").Count());
+                xfs.SetAttributeValue("count", xfs.Elements(M + "xf").Count());
+                Save(z, e, st);
+                return result;
+            }
+            catch { return null; }
+        }
+
+        static void Save(System.IO.Compression.ZipArchive z, System.IO.Compression.ZipArchiveEntry e, System.Xml.Linq.XDocument d)
+        {
+            string name = e.FullName;
+            e.Delete();
+            var ne = z.CreateEntry(name);
+            using (Stream s = ne.Open())
+            using (var w = System.Xml.XmlWriter.Create(s, new System.Xml.XmlWriterSettings { Encoding = new UTF8Encoding(false) }))
+                d.Save(w);
+        }
+
+        // Copie src vers dst en ajoutant des colonnes après la dernière colonne utilisée.
+        // values : n° de ligne Excel → valeurs (string = texte, double = nombre, null = vide).
+        // fillOf : n° de ligne Excel → couleur de la 1ʳᵉ colonne ajoutée (0 vert, 1 orange, 2 rouge, 3 gris, -1 aucune).
+        public static void WriteWithColumns(string src, string dst, XlsxSheet sheet, int headerRow, string[] headers,
+            Dictionary<int, object[]> values, Dictionary<int, int> fillOf, int[] widths)
+        {
+            File.Copy(src, dst, true);
+            using (var z = System.IO.Compression.ZipFile.Open(dst, System.IO.Compression.ZipArchiveMode.Update))
+            {
+                int[] fills = AddFillStyles(z);
+                System.IO.Compression.ZipArchiveEntry e = Find(z, sheet.Entry);
+                System.Xml.Linq.XDocument doc;
+                using (Stream s = e.Open()) doc = System.Xml.Linq.XDocument.Load(s);
+                var root = doc.Root;
+                var data = root.Element(M + "sheetData");
+                int first = sheet.MaxCol + 1, lastRow = 0;
+                string headerStyle = null;
+                foreach (var row in data.Elements(M + "row"))
+                {
+                    int ri; if (!int.TryParse((string)row.Attribute("r"), out ri)) continue;
+                    if (ri == headerRow)
+                    {
+                        var hc = row.Elements(M + "c").FirstOrDefault();
+                        if (hc != null) headerStyle = (string)hc.Attribute("s");
+                    }
+                }
+                foreach (var row in data.Elements(M + "row"))
+                {
+                    int ri; if (!int.TryParse((string)row.Attribute("r"), out ri)) continue;
+                    if (ri > lastRow) lastRow = ri;
+                    object[] vals = null;
+                    string style = null;
+                    if (ri == headerRow) { vals = headers; style = headerStyle; }
+                    else if (values.TryGetValue(ri, out vals)) { }
+                    if (vals == null) continue;
+                    var spans = row.Attribute("spans"); if (spans != null) spans.Remove();
+                    int fill;
+                    for (int i = 0; i < vals.Length; i++)
+                    {
+                        object v = vals[i];
+                        if (v == null) continue;
+                        var c = new System.Xml.Linq.XElement(M + "c", new System.Xml.Linq.XAttribute("r", ColName(first + i) + ri));
+                        string s = style;
+                        if (i == 0 && ri != headerRow && fills != null && fillOf != null && fillOf.TryGetValue(ri, out fill) && fill >= 0 && fill < fills.Length)
+                            s = fills[fill].ToString();
+                        if (s != null) c.Add(new System.Xml.Linq.XAttribute("s", s));
+                        if (v is double)
+                            c.Add(new System.Xml.Linq.XElement(M + "v", ((double)v).ToString("0.##", CultureInfo.InvariantCulture)));
+                        else
+                        {
+                            c.Add(new System.Xml.Linq.XAttribute("t", "inlineStr"));
+                            c.Add(new System.Xml.Linq.XElement(M + "is", new System.Xml.Linq.XElement(M + "t",
+                                new System.Xml.Linq.XAttribute(System.Xml.Linq.XNamespace.Xml + "space", "preserve"), Convert.ToString(v, CultureInfo.InvariantCulture))));
+                        }
+                        row.Add(c);
+                    }
+                }
+                var dim = root.Element(M + "dimension");
+                if (dim != null) dim.SetAttributeValue("ref", "A1:" + ColName(first + headers.Length - 1) + Math.Max(lastRow, 1));
+                var cols = root.Element(M + "cols");
+                if (cols == null) { cols = new System.Xml.Linq.XElement(M + "cols"); data.AddBeforeSelf(cols); }
+                for (int i = 0; i < headers.Length; i++)
+                {
+                    int w = widths != null && i < widths.Length ? widths[i] : 20;
+                    cols.Add(new System.Xml.Linq.XElement(M + "col",
+                        new System.Xml.Linq.XAttribute("min", first + i + 1), new System.Xml.Linq.XAttribute("max", first + i + 1),
+                        new System.Xml.Linq.XAttribute("width", w), new System.Xml.Linq.XAttribute("customWidth", "1")));
+                }
+                Save(z, e, doc);
+            }
+        }
+    }
+
+    // ───────────────────────── Rapprochement d'un rapport de paiement (PFS…) ─────────────────────────
+    // Lecture seule côté Sage : retrouve pour chaque ligne du rapport la facture correspondante.
+
+    class ReportLine
+    {
+        public int Row;                 // n° de ligne Excel
+        public string Order = "", Client = "";
+        public double HtValide, HtCommande;
+        public bool HasHtCommande;
+        // Résultat
+        public string Resultat = "", Numero = "", ClientSage = "", Remarque = "";
+        public string Reglement = "";   // après « Marquer en soldé » : n° du règlement ou message d'erreur
+        public ListViewItem Item;
+        public double HtFacture = double.NaN;
+        public int Fill = -1;           // 0 vert, 1 orange, 2 rouge, 3 gris
+    }
+
+    class PaymentReconciler
+    {
+        public const string TROUVEE = "Trouvée", DEJA = "Déjà soldée", VERIF = "À vérifier", INTROUVABLE = "Introuvable";
+        const double TOL = 0.011;
+
+        readonly List<PieceRow> open = new List<PieceRow>();      // factures validées non soldées
+        readonly List<PieceRow> provis = new List<PieceRow>();    // factures provisoires (ignorées)
+        readonly List<PieceRow> avoirs = new List<PieceRow>();    // avoirs non soldés
+        readonly List<PieceRow> soldees = new List<PieceRow>();   // factures déjà soldées
+        readonly HashSet<string> used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        readonly Func<string, string> historyLookup;
+
+        public PaymentReconciler(List<PieceRow> pieces, Func<string, string> history)
+        {
+            historyLookup = history;
+            foreach (PieceRow p in pieces)
+            {
+                string k = p.Kind;
+                if (k == "facture")
+                {
+                    if (p.Soldee) soldees.Add(p);
+                    else if (p.Valide) open.Add(p);
+                    else provis.Add(p);
+                }
+                else if (k == "avoir" && !p.Soldee) avoirs.Add(p);
+            }
+            // Les plus anciennes d'abord (attribution des doublons dans l'ordre des numéros).
+            Comparison<PieceRow> byNum = delegate(PieceRow a, PieceRow b) { return string.CompareOrdinal(a.Num, b.Num); };
+            open.Sort(byNum); avoirs.Sort(byNum);
+        }
+
+        public int OpenCount { get { return open.Count; } }
+
+        static readonly HashSet<string> LegalWords = new HashSet<string> {
+            "sarl", "sas", "sasu", "eurl", "eirl", "snc", "sa", "sci", "ei", "ste", "societe", "ets", "inc", "ltd", "llc", "gmbh", "srl", "sl", "bv", "sprl", "srls", "spa", "the", "et", "and", "co"
+        };
+
+        static string Core(string s)
+        {
+            var parts = new List<string>();
+            foreach (string w in Norm.Text(s).Split(' ')) if (w.Length > 0 && !LegalWords.Contains(w)) parts.Add(w);
+            return string.Join(" ", parts.ToArray());
+        }
+
+        // 3 = nom identique, 2 = identique hors forme juridique, 1 = l'un contient l'autre, 0 = différent.
+        static int NameLevel(string report, PieceRow p)
+        {
+            int best = 0;
+            foreach (string n in new[] { p.Societe, p.CliName })
+            {
+                if (string.IsNullOrEmpty(n)) continue;
+                string a = Norm.Text(report), b = Norm.Text(n);
+                if (a.Length == 0 || b.Length == 0) continue;
+                if (a == b) return 3;
+                string ca = Core(report), cb = Core(n);
+                if (ca.Length > 0 && ca == cb) { best = Math.Max(best, 2); continue; }
+                string shorter = ca.Length <= cb.Length ? ca : cb, longer = ca.Length <= cb.Length ? cb : ca;
+                if (shorter.Length >= 4 && (" " + longer + " ").Contains(" " + shorter + " ")) best = Math.Max(best, 1);
+            }
+            return best;
+        }
+
+        static bool Same(double a, double b) { return Math.Abs(a - b) <= TOL; }
+        static string M(double v) { return v.ToString("#,##0.00", CultureInfo.GetCultureInfo("fr-FR")); }
+        static string Desc(PieceRow p) { return p.Num + " (" + M(p.TotalHT) + " HT)"; }
+        static string ClientOf(PieceRow p) { return (p.Client.Length > 0 ? p.Client + " – " : "") + p.NomAffiche; }
+
+        void Assign(ReportLine l, PieceRow p, string resultat, int fill)
+        {
+            l.Resultat = resultat; l.Numero = p.Num; l.ClientSage = ClientOf(p); l.HtFacture = p.TotalHT; l.Fill = fill;
+            if (resultat == TROUVEE) used.Add(p.Num);
+        }
+
+        void Note(ReportLine l, string s) { l.Remarque = l.Remarque.Length == 0 ? s : l.Remarque + " • " + s; }
+
+        public void Match(ReportLine l)
+        {
+            // 1) Historique SageBridge : n° de commande → n° de facture (rapprochement exact).
+            string hist = historyLookup == null || l.Order.Length == 0 ? null : historyLookup(l.Order);
+            if (!string.IsNullOrEmpty(hist))
+            {
+                PieceRow p = open.Find(delegate(PieceRow x) { return string.Equals(x.Num, hist, StringComparison.OrdinalIgnoreCase); });
+                if (p != null && !used.Contains(p.Num))
+                {
+                    if (Same(p.TotalHT, l.HtValide)) { Assign(l, p, TROUVEE, 0); Note(l, "par le n° de commande (historique SageBridge)"); return; }
+                    Assign(l, p, VERIF, 1);
+                    Note(l, "facture de cette commande (historique SageBridge) mais HT " + M(p.TotalHT) + " ≠ validé " + M(l.HtValide) + " (écart " + M(p.TotalHT - l.HtValide) + ") : avoir à faire ?");
+                    AddAvoirHints(l, NamedAvoirs(l.Client), p);
+                    return;
+                }
+                PieceRow s = soldees.Find(delegate(PieceRow x) { return string.Equals(x.Num, hist, StringComparison.OrdinalIgnoreCase); });
+                if (s != null) { Assign(l, s, DEJA, 3); Note(l, "facture de cette commande déjà soldée dans Sage"); return; }
+                PieceRow pv = provis.Find(delegate(PieceRow x) { return string.Equals(x.Num, hist, StringComparison.OrdinalIgnoreCase); });
+                if (pv != null) Note(l, "facture " + Desc(pv) + " de cette commande encore provisoire (ignorée)");
+            }
+
+            // 2) Nom + montant HT validé.
+            var named = new List<PieceRow>();
+            int bestLevel = 0;
+            foreach (PieceRow p in open)
+            {
+                int lv = NameLevel(l.Client, p);
+                if (lv == 0) continue;
+                if (lv > bestLevel) { bestLevel = lv; named.Clear(); }
+                if (lv == bestLevel) named.Add(p);
+            }
+            var exact = named.FindAll(delegate(PieceRow p) { return !used.Contains(p.Num) && Same(p.TotalHT, l.HtValide); });
+            if (exact.Count >= 1)
+            {
+                Assign(l, exact[0], TROUVEE, 0);
+                if (bestLevel == 1) Note(l, "nom approchant : « " + exact[0].NomAffiche + " »");
+                if (exact.Count > 1)
+                {
+                    var others = new List<string>();
+                    for (int i = 1; i < exact.Count; i++) others.Add(exact[i].Num);
+                    Note(l, exact.Count + " factures identiques (même nom, même HT) : la plus ancienne est retenue, autres : " + string.Join(", ", others.ToArray()));
+                }
+                return;
+            }
+
+            // 3) Déjà soldée ?
+            PieceRow done = soldees.Find(delegate(PieceRow p) { return Same(p.TotalHT, l.HtValide) && NameLevel(l.Client, p) > 0; });
+            if (done != null) { Assign(l, done, DEJA, 3); Note(l, "déjà soldée dans Sage : rien à faire"); return; }
+
+            // 4) Introuvable : pistes.
+            l.Resultat = INTROUVABLE; l.Fill = 2;
+            var free = named.FindAll(delegate(PieceRow p) { return !used.Contains(p.Num); });
+            if (free.Count > 0)
+            {
+                l.ClientSage = ClientOf(free[0]);
+                var lst = new List<string>();
+                foreach (PieceRow p in free) lst.Add(p.Num + " (" + M(p.TotalHT) + " HT, écart " + M(p.TotalHT - l.HtValide) + ")");
+                Note(l, "autre(s) facture(s) non soldée(s) à ce nom, montant différent : " + string.Join(", ", lst.ToArray()));
+                if (l.HasHtCommande && !Same(l.HtCommande, l.HtValide))
+                {
+                    PieceRow pc = free.Find(delegate(PieceRow p) { return Same(p.TotalHT, l.HtCommande); });
+                    if (pc != null)
+                    {
+                        l.Resultat = VERIF; l.Fill = 1; l.Numero = pc.Num; l.HtFacture = pc.TotalHT;
+                        Note(l, pc.Num + " correspond au montant COMMANDÉ (" + M(l.HtCommande) + ") mais PFS n'a validé que " + M(l.HtValide) + " : avoir de " + M(l.HtCommande - l.HtValide) + " HT à faire ?");
+                    }
+                }
+            }
+            AddAvoirHints(l, NamedAvoirs(l.Client), null);
+            if (free.Count == 0)
+            {
+                PieceRow pv = provis.Find(delegate(PieceRow p) { return NameLevel(l.Client, p) > 0 && Same(p.TotalHT, l.HtValide); });
+                if (pv != null) Note(l, "facture provisoire " + Desc(pv) + " à ce nom et ce montant (ignorée : à valider dans Sage)");
+                var sameAmount = open.FindAll(delegate(PieceRow p) { return !used.Contains(p.Num) && Same(p.TotalHT, l.HtValide); });
+                if (sameAmount.Count > 0 && sameAmount.Count <= 5)
+                {
+                    var lst = new List<string>();
+                    foreach (PieceRow p in sameAmount) lst.Add(p.Num + " « " + p.NomAffiche + " »");
+                    Note(l, "aucune facture non soldée à ce nom ; même montant HT sous un autre nom : " + string.Join(", ", lst.ToArray()));
+                    if (l.Resultat == INTROUVABLE) { l.Resultat = VERIF; l.Fill = 1; }
+                }
+                else if (l.Remarque.Length == 0) Note(l, "aucune facture non soldée à ce nom");
+            }
+        }
+
+        List<PieceRow> NamedAvoirs(string client)
+        {
+            return avoirs.FindAll(delegate(PieceRow a) { return NameLevel(client, a) > 0; });
+        }
+
+        void AddAvoirHints(ReportLine l, List<PieceRow> avs, PieceRow onlyInvoice)
+        {
+            if (avs.Count == 0) return;
+            var lst = new List<string>();
+            foreach (PieceRow a in avs) lst.Add(Desc(a));
+            Note(l, "avoir(s) non soldé(s) à ce nom : " + string.Join(", ", lst.ToArray()));
+            // Facture − avoir = montant validé ?
+            foreach (PieceRow f in open)
+            {
+                if (used.Contains(f.Num)) continue;
+                if (onlyInvoice != null && f != onlyInvoice) continue;
+                if (NameLevel(l.Client, f) == 0) continue;
+                foreach (PieceRow a in avs)
+                {
+                    if (Same(f.TotalHT - Math.Abs(a.TotalHT), l.HtValide))
+                    {
+                        l.Resultat = VERIF; l.Fill = 1; l.Numero = f.Num; l.HtFacture = f.TotalHT; l.ClientSage = ClientOf(f);
+                        Note(l, f.Num + " − avoir " + a.Num + " = montant validé " + M(l.HtValide) + " : facture à solder avec l'avoir");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    class ReconcileForm : Form
+    {
+        readonly string path;
+        readonly SageWorker sage;
+        readonly Func<string, string> history;
+        readonly Action<string> log;
+        readonly ProgressBar bar;
+        readonly Label lblStep, lblSummary;
+        readonly ListView list;
+        readonly Button btnOpen, btnClose, btnSolder;
+        string outPath;
+        volatile bool closing;
+        XlsxSheet sheet;
+        int headerRowIndex;
+        List<ReportLine> lines;
+        bool solderDone;
+
+        public ReconcileForm(string file, SageWorker worker, Func<string, string> hist, Action<string> logger)
+        {
+            path = file; sage = worker; history = hist; log = logger;
+            Text = "Rapprochement des paiements — " + Path.GetFileName(file);
+            Font = new Font("Segoe UI", 9.5f);
+            Icon = Program.AppIcon;
+            StartPosition = FormStartPosition.CenterParent;
+            ShowInTaskbar = false;
+            MinimizeBox = false;
+            Size = new Size(Ui2.Px(1150), Ui2.Px(640));
+
+            var top = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, Padding = new Padding(Ui2.Px(10)) };
+            lblStep = new Label { AutoSize = true, Text = "Lecture du fichier…", Margin = new Padding(3, 3, 3, 6) };
+            bar = new ProgressBar { Dock = DockStyle.Top, Height = Ui2.Px(20), Minimum = 0, Maximum = 100 };
+            top.Controls.Add(lblStep); top.Controls.Add(bar);
+
+            list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true, HideSelection = false };
+            string[] cols = { "Ligne", "Commande", "Client (rapport)", "HT validé", "Résultat", "Facture Sage", "Client Sage", "Règlement Sage", "Remarque" };
+            int[] widths = { 50, 115, 200, 80, 95, 100, 170, 260, 480 };
+            for (int i = 0; i < cols.Length; i++) list.Columns.Add(cols[i], Ui2.Px(widths[i]));
+
+            var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(Ui2.Px(8)) };
+            btnClose = new Button { Text = "Fermer", AutoSize = true };
+            btnClose.Click += delegate { Close(); };
+            btnOpen = new Button { Text = "Ouvrir le fichier Excel", AutoSize = true, Enabled = false };
+            btnOpen.Click += delegate { try { Process.Start(outPath); } catch (Exception e) { MessageBox.Show(this, e.Message, "SageBridge"); } };
+            btnSolder = new Button { Text = "Marquer les factures trouvées en soldé", AutoSize = true, Enabled = false, Font = new Font("Segoe UI Semibold", 9.5f) };
+            btnSolder.Click += delegate { AskSolder(); };
+            lblSummary = new Label { AutoSize = true, Margin = new Padding(3, Ui2.Px(7), Ui2.Px(20), 3) };
+            bottom.Controls.Add(btnClose); bottom.Controls.Add(btnOpen); bottom.Controls.Add(btnSolder); bottom.Controls.Add(lblSummary);
+
+            Controls.Add(list); Controls.Add(top); Controls.Add(bottom);
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (solderRunning && e.CloseReason == CloseReason.UserClosing)
+                {
+                    MessageBox.Show(this, "Les factures sont en train d'être soldées dans Sage : attendez la fin du traitement.", "SageBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    e.Cancel = true; return;
+                }
+                closing = true;
+            };
+            Shown += delegate { var th = new Thread(Work) { IsBackground = true }; th.Start(); };
+        }
+
+        void Ui(Action a)
+        {
+            if (IsDisposed || closing) return;
+            try { BeginInvoke(a); } catch { }
+        }
+
+        static double Num(string s)
+        {
+            s = (s ?? "").Replace("€", "").Replace(" ", "").Replace(" ", "").Trim();
+            double d;
+            if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
+            if (double.TryParse(s.Replace(',', '.'), NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
+            return double.NaN;
+        }
+
+        void Step(string text, int value, int max)
+        {
+            Ui(delegate
+            {
+                lblStep.Text = text;
+                bar.Maximum = Math.Max(1, max);
+                bar.Value = Math.Max(0, Math.Min(bar.Maximum, value));
+            });
+        }
+
+        void Work()
+        {
+            try { WorkInner(); }
+            catch (Exception e)
+            {
+                log("Rapprochement : " + e.Message);
+                Ui(delegate
+                {
+                    lblStep.Text = "Erreur : " + e.Message; lblStep.ForeColor = Color.Firebrick;
+                    MessageBox.Show(this, e.Message, "Rapprochement impossible", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                });
+            }
+        }
+
+        void WorkInner()
+        {
+            // 1) Fichier
+            sheet = Xlsx.Read(path);
+            int headerRow = -1, cOrder = -1, cClient = -1, cValide = -1, cCommande = -1;
+            for (int r = 0; r < Math.Min(15, sheet.Rows.Count) && headerRow < 0; r++)
+            {
+                XlsxRow xr = sheet.Rows[r];
+                int o = -1, c = -1, v = -1, cm = -1;
+                foreach (KeyValuePair<int, string> kv in xr.Cells)
+                {
+                    string h = Norm.Text(kv.Value);
+                    if (h.Contains("montant valide ht") || (h.Contains("valide") && h.Contains("ht") && h.Contains("montant"))) v = kv.Key;
+                    else if (h.Contains("montant commande ht")) cm = kv.Key;
+                    else if (h == "client" || (h.Contains("client") && !h.Contains("montant") && c < 0)) c = kv.Key;
+                    else if (h.Contains("commande") && !h.Contains("montant") && o < 0) o = kv.Key;
+                }
+                if (c >= 0 && v >= 0) { headerRow = r; cOrder = o; cClient = c; cValide = v; cCommande = cm; }
+            }
+            if (headerRow < 0)
+                throw new Exception("Colonnes « Client » et « Montant validé HT » introuvables dans la 1ʳᵉ feuille du fichier : est-ce bien un export de paiements Paris Fashion Shop ?");
+
+            headerRowIndex = sheet.Rows[headerRow].Index;
+            lines = new List<ReportLine>();
+            for (int r = headerRow + 1; r < sheet.Rows.Count; r++)
+            {
+                XlsxRow xr = sheet.Rows[r];
+                string client = xr.Get(cClient).Trim();
+                double ht = Num(xr.Get(cValide));
+                if (client.Length == 0 && double.IsNaN(ht)) continue;
+                var l = new ReportLine { Row = xr.Index, Order = xr.Get(cOrder).Trim(), Client = client, HtValide = ht };
+                double hc = cCommande >= 0 ? Num(xr.Get(cCommande)) : double.NaN;
+                if (!double.IsNaN(hc)) { l.HtCommande = hc; l.HasHtCommande = true; }
+                lines.Add(l);
+            }
+            if (lines.Count == 0) throw new Exception("Aucune ligne de paiement dans le fichier.");
+            log("Rapprochement de « " + Path.GetFileName(path) + " » : " + lines.Count + " ligne(s).");
+
+            // 2) Factures Sage (lecture seule)
+            Step("Lecture des factures dans Sage…", 0, 1);
+            List<PieceRow> pieces = sage.ListPieces(delegate(int done, int total)
+            {
+                Step("Lecture des factures dans Sage : " + done + " / " + total, done, total);
+            });
+            var rec = new PaymentReconciler(pieces, history);
+
+            // 3) Ligne par ligne
+            int ok = 0, verif = 0, ko = 0, deja = 0;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (closing) return;
+                ReportLine l = lines[i];
+                Step("Rapprochement ligne " + (i + 1) + " / " + lines.Count + " : " + l.Client, i, lines.Count);
+                if (double.IsNaN(l.HtValide)) { l.Resultat = PaymentReconciler.INTROUVABLE; l.Fill = 2; l.Remarque = "montant validé HT illisible"; }
+                else rec.Match(l);
+                if (l.Resultat == PaymentReconciler.TROUVEE) ok++;
+                else if (l.Resultat == PaymentReconciler.VERIF) verif++;
+                else if (l.Resultat == PaymentReconciler.DEJA) deja++;
+                else ko++;
+                ReportLine cur = l;
+                Ui(delegate { AddRow(cur); });
+                Thread.Sleep(20);
+            }
+
+            // 4) Fichier résultat
+            Step("Écriture du fichier Excel…", lines.Count, lines.Count);
+            outPath = WriteExcel();
+            string summary = lines.Count + " lignes : " + ok + " trouvée(s), " + verif + " à vérifier, " + ko + " introuvable(s)" + (deja > 0 ? ", " + deja + " déjà soldée(s)" : "")
+                + " — " + rec.OpenCount + " facture(s) non soldée(s) dans Sage.";
+            log("Rapprochement terminé : " + summary + " Fichier : " + outPath);
+            int nTrouvees = ok;
+            Ui(delegate
+            {
+                lblStep.Text = "Terminé. Fichier enregistré : " + outPath;
+                bar.Value = bar.Maximum;
+                lblSummary.Text = summary;
+                btnOpen.Enabled = true;
+                if (nTrouvees > 0)
+                {
+                    btnSolder.Text = "Marquer les " + nTrouvees + " facture(s) trouvée(s) en soldé";
+                    btnSolder.Enabled = true;
+                    btnSolder.Focus();
+                }
+                else btnOpen.Focus();
+            });
+        }
+
+        static string Eur(double v) { return v.ToString("#,##0.00", CultureInfo.GetCultureInfo("fr-FR")) + " €"; }
+
+        // Écrit (ou réécrit) la copie « … - rapproché.xlsx ». Après « Marquer en soldé », on réécrit
+        // d'abord le même fichier ; s'il est ouvert dans Excel, on prend le nom libre suivant.
+        string WriteExcel()
+        {
+            var values = new Dictionary<int, object[]>();
+            var fills = new Dictionary<int, int>();
+            foreach (ReportLine l in lines)
+            {
+                var v = new List<object> { l.Resultat, l.Numero, l.ClientSage, double.IsNaN(l.HtFacture) ? null : (object)l.HtFacture,
+                    double.IsNaN(l.HtFacture) || double.IsNaN(l.HtValide) ? null : (object)Math.Round(l.HtFacture - l.HtValide, 2), l.Remarque };
+                if (solderDone) v.Add(l.Reglement.Length > 0 ? l.Reglement : null);
+                values[l.Row] = v.ToArray();
+                fills[l.Row] = l.Fill;
+            }
+            var headers = new List<string> { "Rapprochement", "N° facture Sage", "Client Sage", "HT facture Sage", "Écart HT", "Remarque" };
+            if (solderDone) headers.Add("Règlement Sage");
+            int[] widths = { 16, 16, 30, 14, 10, 90, 45 };
+            string dir = Path.GetDirectoryName(path), name = Path.GetFileNameWithoutExtension(path);
+            var candidates = new List<string>();
+            if (!string.IsNullOrEmpty(outPath)) candidates.Add(outPath);
+            for (int n = 1; n < 50; n++) candidates.Add(Path.Combine(dir, name + " - rapproché" + (n > 1 ? " (" + n + ")" : "") + ".xlsx"));
+            foreach (string dst in candidates)
+            {
+                try { Xlsx.WriteWithColumns(path, dst, sheet, headerRowIndex, headers.ToArray(), values, fills, widths); return dst; }
+                catch (IOException) { /* fichier ouvert dans Excel : nom suivant */ }
+                catch (UnauthorizedAccessException) { }
+            }
+            throw new Exception("Impossible d'écrire le fichier résultat à côté de « " + path + " ».");
+        }
+
+        // ── Marquer en soldé : un règlement par facture « Trouvée » ──
+
+        volatile bool solderRunning;
+
+        void AskSolder()
+        {
+            if (lines == null || solderRunning) return;
+            var todo = lines.FindAll(delegate(ReportLine l) { return l.Resultat == PaymentReconciler.TROUVEE && l.Reglement.Length == 0 && l.Numero.Length > 0; });
+            if (todo.Count == 0) return;
+            string exemple = todo[0].Order.Length > 0 ? " (ex. " + todo[0].Order + ")" : "";
+            string msg = todo.Count + " facture(s) « Trouvée » vont être marquées SOLDÉES dans Sage.\n\n"
+                + "Pour chacune, SageBridge enregistre un règlement client :\n"
+                + "   • mode de paiement " + SageWorker.MODE_REGLEMENT + " (virement)\n"
+                + "   • date du jour (" + DateTime.Today.ToString("dd/MM/yyyy") + ")\n"
+                + "   • montant = reste dû TTC de la facture\n"
+                + "   • référence = n° de commande" + exemple + "\n\n"
+                + "Les lignes « À vérifier », « Introuvable » et « Déjà soldée » ne sont pas touchées.\n"
+                + "Un règlement peut se supprimer ensuite dans Sage si besoin.\n\nContinuer ?";
+            if (MessageBox.Show(this, msg, "Marquer en soldé", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            solderRunning = true;
+            btnSolder.Enabled = false; btnClose.Enabled = false;
+            var th = new Thread(delegate() { SolderWork(todo); }) { IsBackground = true };
+            th.Start();
+        }
+
+        void SolderWork(List<ReportLine> todo)
+        {
+            int ok = 0, skip = 0, err = 0, consecutive = 0;
+            try
+            {
+                // Relecture : l'état a pu changer depuis le rapprochement (saisie dans Sage entre-temps).
+                Step("Relecture des factures dans Sage…", 0, 1);
+                List<PieceRow> fresh = sage.ListPieces(delegate(int done, int total) { Step("Relecture des factures dans Sage : " + done + " / " + total, done, total); });
+                var byNum = new Dictionary<string, PieceRow>(StringComparer.OrdinalIgnoreCase);
+                foreach (PieceRow p in fresh) if (p.Kind == "facture" && !byNum.ContainsKey(p.Num)) byNum[p.Num] = p;
+                log("Marquage en soldé : " + todo.Count + " facture(s) à solder.");
+
+                for (int i = 0; i < todo.Count; i++)
+                {
+                    ReportLine l = todo[i];
+                    Step("Solde de " + l.Numero + " (" + (i + 1) + " / " + todo.Count + ") : " + l.Client, i, todo.Count);
+                    PieceRow p;
+                    if (!byNum.TryGetValue(l.Numero, out p)) { l.Reglement = "Non soldée : facture introuvable à la relecture"; skip++; }
+                    else if (p.Soldee) { l.Reglement = "Déjà soldée dans Sage"; skip++; }
+                    else if (!p.Valide) { l.Reglement = "Non soldée : facture provisoire"; skip++; }
+                    else if (p.SoldeDu <= 0.004) { l.Reglement = "Non soldée : solde dû nul"; skip++; }
+                    else if (Math.Abs(p.TotalHT - l.HtValide) > 0.011) { l.Reglement = "Non soldée : le HT de la facture a changé (" + Eur(p.TotalHT) + ")"; skip++; }
+                    else
+                    {
+                        double montant = Math.Round(p.SoldeDu, 2);
+                        try
+                        {
+                            SolderResult r = sage.SolderFacture(p.Num, p.Client, montant, l.Order, false);
+                            l.Reglement = "Soldée – règlement " + r.Numero + " de " + Eur(montant);
+                            ok++; consecutive = 0;
+                        }
+                        catch (Exception e)
+                        {
+                            l.Reglement = "Erreur : " + e.Message;
+                            log("Solde de " + p.Num + " impossible : " + e.Message);
+                            err++; consecutive++;
+                        }
+                    }
+                    UpdateRow(l);
+                    if (consecutive >= 3)
+                    {
+                        for (int k = i + 1; k < todo.Count; k++) { todo[k].Reglement = "Non traitée (arrêt après 3 erreurs de suite)"; UpdateRow(todo[k]); }
+                        log("Marquage en soldé arrêté après 3 erreurs de suite.");
+                        break;
+                    }
+                }
+
+                // Vérification : le statut Sage doit être « Soldé ».
+                Step("Vérification dans Sage…", todo.Count, todo.Count);
+                var after = new Dictionary<string, PieceRow>(StringComparer.OrdinalIgnoreCase);
+                foreach (PieceRow p in sage.ListPieces(null)) if (p.Kind == "facture" && !after.ContainsKey(p.Num)) after[p.Num] = p;
+                int notSolde = 0;
+                foreach (ReportLine l in todo)
+                {
+                    if (!l.Reglement.StartsWith("Soldée")) continue;
+                    PieceRow p;
+                    if (after.TryGetValue(l.Numero, out p) && !p.Soldee)
+                    {
+                        l.Reglement += " — ATTENTION : statut Sage « " + p.Statut + " » (reste dû " + Eur(p.SoldeDu) + ")";
+                        notSolde++; UpdateRow(l);
+                    }
+                }
+
+                solderDone = true;
+                outPath = WriteExcel();
+                string summary = ok + " facture(s) soldée(s)" + (skip > 0 ? ", " + skip + " ignorée(s)" : "") + (err > 0 ? ", " + err + " erreur(s)" : "")
+                    + (notSolde > 0 ? ", " + notSolde + " sans statut Soldé" : "") + ".";
+                log("Marquage en soldé terminé : " + summary + " Fichier : " + outPath);
+                bool warn = err > 0 || notSolde > 0;
+                Ui(delegate
+                {
+                    lblStep.Text = "Marquage terminé. Fichier mis à jour : " + outPath;
+                    bar.Value = bar.Maximum;
+                    lblSummary.Text = summary;
+                    btnSolder.Text = "Factures soldées";
+                    MessageBox.Show(this, summary + "\n\nLe détail est dans la colonne « Règlement Sage » du fichier Excel.", "Marquer en soldé",
+                        MessageBoxButtons.OK, warn ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                });
+            }
+            catch (Exception e)
+            {
+                log("Marquage en soldé interrompu : " + e.Message);
+                int done = ok;
+                Ui(delegate
+                {
+                    lblStep.Text = "Erreur : " + e.Message; lblStep.ForeColor = Color.Firebrick;
+                    MessageBox.Show(this, e.Message + (done > 0 ? "\n\n" + done + " facture(s) ont déjà été soldées (voir le journal)." : ""), "Marquer en soldé", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                });
+            }
+            finally
+            {
+                solderRunning = false;
+                Ui(delegate { btnClose.Enabled = true; });
+            }
+        }
+
+        void UpdateRow(ReportLine l)
+        {
+            ReportLine cur = l;
+            Ui(delegate
+            {
+                if (cur.Item == null) return;
+                ListViewItem.ListViewSubItem s = cur.Item.SubItems[7];
+                s.Text = cur.Reglement;
+                bool good = cur.Reglement.StartsWith("Soldée") && !cur.Reglement.Contains("ATTENTION");
+                bool bad = cur.Reglement.StartsWith("Erreur") || cur.Reglement.Contains("ATTENTION");
+                s.BackColor = good ? Color.FromArgb(198, 239, 206) : bad ? Color.FromArgb(255, 199, 206) : Color.FromArgb(231, 230, 230);
+                cur.Item.EnsureVisible();
+            });
+        }
+
+        void AddRow(ReportLine l)
+        {
+            var it = new ListViewItem(new[] {
+                l.Row.ToString(), l.Order, l.Client, double.IsNaN(l.HtValide) ? "" : l.HtValide.ToString("0.00"),
+                l.Resultat, l.Numero, l.ClientSage, l.Reglement, l.Remarque });
+            Color[] bg = { Color.FromArgb(198, 239, 206), Color.FromArgb(255, 235, 156), Color.FromArgb(255, 199, 206), Color.FromArgb(231, 230, 230) };
+            it.UseItemStyleForSubItems = false;
+            if (l.Fill >= 0 && l.Fill < bg.Length) it.SubItems[4].BackColor = bg[l.Fill];
+            l.Item = it;
+            list.Items.Add(it);
+            it.EnsureVisible();
+        }
+    }
 
     static class Ui2
     {
