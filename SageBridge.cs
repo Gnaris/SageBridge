@@ -34,8 +34,8 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Beli & Jolie")]
 [assembly: AssemblyProduct("SageBridge")]
 [assembly: AssemblyCopyright("© 2026 Beli & Jolie")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
+[assembly: AssemblyVersion("1.4.1.0")]
+[assembly: AssemblyFileVersion("1.4.1.0")]
 
 namespace SageBridge
 {
@@ -277,6 +277,13 @@ namespace SageBridge
     {
         public string Site = "", OrderNo = "", Client = "", Reference = "", Remarque = "";
         public bool Force, Simulation;
+        // 1.4.1 : « creer » (défaut), « remplacer » (toutes les lignes de la facture provisoire
+        // Numero sont supprimées puis remplacées) ou « ajouter » (lignes ajoutées à la fin).
+        public string Mode = "creer", Numero = "";
+        // Mode « ajouter » : une ligne identique (article + prix + TVA + description, couleurs
+        // additionnées) à une ligne déjà présente augmente sa quantité au lieu d'être ajoutée.
+        public bool Merge = true;
+        public bool IsCreate { get { return Mode == "creer"; } }
         public CustomerInfo Customer;   // adresse de facturation
         public CustomerInfo Shipping;   // adresse de livraison (facultative)
         public List<InvoiceLine> Lines = new List<InvoiceLine>();
@@ -285,8 +292,8 @@ namespace SageBridge
     class InvoiceResult
     {
         public bool Ok, Duplicate, Simulated, ClientCreated, ClientMatched;
-        public string Numero = "", Error = "", ClientCode = "", ClientName = "", ClientModeTVA = "";
-        public int NbLines;
+        public string Numero = "", Error = "", ClientCode = "", ClientName = "", ClientModeTVA = "", Mode = "creer";
+        public int NbLines, LinesBefore, LinesAfter, LinesMerged;
         public double TotalHT, TotalTTC;
         public List<string> Messages = new List<string>();
     }
@@ -862,6 +869,12 @@ namespace SageBridge
             {
                 InvoiceResult r;
                 try { r = CreateInner(req); }
+                catch (SavedButUnverifiedException sv)
+                {
+                    r = new InvoiceResult();
+                    r.Mode = req.Mode; r.Numero = req.Numero;
+                    r.Error = sv.Message;
+                }
                 catch (Exception first)
                 {
                     // Une reconnexion suffit souvent (Sage redémarré entre-temps, etc.).
@@ -1778,8 +1791,271 @@ namespace SageBridge
 
         // ── Facture ──
 
+        // Ajoute les lignes de la requête à la pièce chargée ou créée (prix fourni : AddLine, jamais AddLineAutoCalc).
+        void AddRequestLines(dynamic piece, dynamic line, InvoiceRequest req, bool exonere, InvoiceResult res)
+        {
+            int n = 0;
+            foreach (InvoiceLine l in req.Lines)
+            {
+                line.RazLine();
+                line.Article = l.Code;
+                line.Quantite = l.Qty;
+                if (l.HasPuht) line.PUHT = l.Puht;   // AddLine garde ce prix (AddLineAutoCalc le remplacerait par le tarif)
+                double tva = exonere ? 0 : l.Tva;
+                if (tva >= 0) { try { line.TauxTVA = tva; } catch (Exception e) { res.Messages.Add("TVA ligne " + (n + 1) + " : " + ComMessage(e)); } }
+                string desc = Norm.RtfToText(l.Description);
+                if (!string.IsNullOrEmpty(desc)) { try { line.Description = desc; } catch (Exception e) { res.Messages.Add("Description ligne " + (n + 1) + " : " + ComMessage(e)); } }
+                if (!(bool)piece.AddLine(line)) throw new Exception("Ligne " + (n + 1) + " (article « " + l.Code + " ») refusée par Sage : l'article existe-t-il dans le dossier ?");
+                n++;
+            }
+            res.NbLines = n;
+        }
+
+        // ── Fusion des lignes identiques (mode « ajouter ») ──
+        class ExistingLine { public int Index; public string Article = "", Desc = ""; public double Qty, Puht, Tva; }
+
+        static readonly Regex ColorLine = new Regex(@"^(.+?) x(\d+(?:[.,]\d+)?)$");
+
+        static List<string> DescLines(string d)
+        {
+            var outp = new List<string>();
+            foreach (string l in (d ?? "").Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+            {
+                string t = l.Trim();
+                if (t.Length > 0) outp.Add(t);
+            }
+            return outp;
+        }
+
+        // Fusionne deux descriptions « Désignation[ - réf] » + lignes « Couleur xN ».
+        // Renvoie null si elles ne désignent pas le même article (entête différent, ou
+        // lignes qui ne sont pas des couleurs et diffèrent).
+        static string MergeDesc(string existing, string added)
+        {
+            List<string> a = DescLines(existing), b = DescLines(added);
+            if (a.Count == 0 && b.Count == 0) return "";
+            if (a.Count == 0 || b.Count == 0) return null;
+            if (!string.Equals(a[0], b[0], StringComparison.OrdinalIgnoreCase)) return null;
+            var order = new List<string>();
+            var qty = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            var label = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (List<string> src in new[] { a, b })
+            {
+                for (int i = 1; i < src.Count; i++)
+                {
+                    Match m = ColorLine.Match(src[i]);
+                    if (!m.Success)
+                    {
+                        // Pas une ligne de couleur : on ne fusionne que si les descriptions sont identiques.
+                        return string.Join("\n", a.ToArray()).Equals(string.Join("\n", b.ToArray()), StringComparison.OrdinalIgnoreCase)
+                            ? string.Join("\n", a.ToArray()) : null;
+                    }
+                    string k = m.Groups[1].Value.Trim();
+                    double n = double.Parse(m.Groups[2].Value.Replace(',', '.'), CultureInfo.InvariantCulture);
+                    if (!qty.ContainsKey(k)) { order.Add(k); qty[k] = 0; label[k] = k; }
+                    qty[k] += n;
+                }
+            }
+            var sb = new StringBuilder(a[0]);
+            foreach (string k in order) sb.Append("\n").Append(label[k]).Append(" x").Append(qty[k].ToString("0.####", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
+
+        List<ExistingLine> ReadLines(dynamic piece, dynamic line)
+        {
+            var outp = new List<ExistingLine>();
+            int nb = (int)piece.NbLines;
+            for (int i = 1; i <= nb; i++)
+            {
+                if (!(bool)piece.LoadLine(i, line)) continue;
+                var e = new ExistingLine { Index = i };
+                try { e.Article = Convert.ToString((object)line.Article, CultureInfo.InvariantCulture) ?? ""; } catch { }
+                try { e.Qty = Convert.ToDouble((object)line.Quantite, CultureInfo.InvariantCulture); } catch { }
+                try { e.Puht = Convert.ToDouble((object)line.PUHT, CultureInfo.InvariantCulture); } catch { }
+                try { e.Tva = Convert.ToDouble((object)line.TauxTVA, CultureInfo.InvariantCulture); } catch { }
+                try { e.Desc = Norm.RtfToText(Convert.ToString((object)line.Description, CultureInfo.InvariantCulture) ?? ""); } catch { }
+                // Ligne avec remise : jamais fusionnée (RazLine l'effacerait).
+                bool remise = false;
+                try { remise = Math.Abs(Convert.ToDouble((object)line.Remise, CultureInfo.InvariantCulture)) > 0.00001; } catch { }
+                if (!remise && e.Article.Length > 0) outp.Add(e);
+            }
+            return outp;
+        }
+
+        // Ajoute les lignes en augmentant la quantité des lignes identiques déjà présentes.
+        // Réécriture d'une ligne : LoadLine + RazLine + TOUS les champs + UpdateLine (séquence
+        // vérifiée live le 04/11/2026 ; sans RazLine, Sage annonce l'enregistrement sans rien changer).
+        void AddOrMergeLines(dynamic piece, dynamic line, InvoiceRequest req, bool exonere, InvoiceResult res)
+        {
+            List<ExistingLine> existing = ReadLines(piece, line);
+            int added = 0, merged = 0, n = 0;
+            foreach (InvoiceLine l in req.Lines)
+            {
+                n++;
+                double tva = exonere ? 0 : l.Tva;
+                string desc = Norm.RtfToText(l.Description);
+                ExistingLine hit = null; string newDesc = null;
+                foreach (ExistingLine e in existing)
+                {
+                    if (!string.Equals(e.Article.Trim(), l.Code.Trim(), StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!l.HasPuht || Math.Abs(e.Puht - l.Puht) > 0.00005) continue;
+                    if (tva >= 0 && Math.Abs(e.Tva - tva) > 0.001) continue;
+                    string md = MergeDesc(e.Desc, desc);
+                    if (md == null) continue;
+                    hit = e; newDesc = md; break;
+                }
+                if (hit == null)
+                {
+                    line.RazLine();
+                    line.Article = l.Code;
+                    line.Quantite = l.Qty;
+                    if (l.HasPuht) line.PUHT = l.Puht;
+                    if (tva >= 0) { try { line.TauxTVA = tva; } catch (Exception ex) { res.Messages.Add("TVA ligne " + n + " : " + ComMessage(ex)); } }
+                    if (!string.IsNullOrEmpty(desc)) { try { line.Description = desc; } catch (Exception ex) { res.Messages.Add("Description ligne " + n + " : " + ComMessage(ex)); } }
+                    if (!(bool)piece.AddLine(line)) throw new Exception("Ligne " + n + " (article « " + l.Code + " ») refusée par Sage : l'article existe-t-il dans le dossier ?");
+                    added++;
+                    continue;
+                }
+                double qty = hit.Qty + l.Qty;
+                if (!(bool)piece.LoadLine(hit.Index, line)) throw new Exception("Impossible de relire la ligne " + hit.Index + " de la facture.");
+                line.RazLine();
+                line.Article = hit.Article;
+                line.Quantite = qty;
+                line.PUHT = hit.Puht;
+                try { line.TauxTVA = hit.Tva; } catch (Exception ex) { res.Messages.Add("TVA ligne " + hit.Index + " : " + ComMessage(ex)); }
+                if (!string.IsNullOrEmpty(newDesc)) { try { line.Description = newDesc; } catch (Exception ex) { res.Messages.Add("Description ligne " + hit.Index + " : " + ComMessage(ex)); } }
+                if (!(bool)piece.UpdateLine(line)) throw new Exception("Sage a refusé de mettre à jour la ligne " + hit.Index + " (article « " + hit.Article + " »).");
+                hit.Qty = qty; hit.Desc = newDesc ?? hit.Desc;
+                merged++;
+            }
+            res.NbLines = added;
+            res.LinesMerged = merged;
+        }
+
+        // 1.4.1 — Remplacer les lignes d'une facture provisoire existante, ou y ajouter des lignes.
+        // Séquence vérifiée live le 12/11/2026 (sans Save) : Load(4, num) ; pour vider,
+        // LoadLine(NbLines, ligne) puis DelLine() (supprime la ligne courante) jusqu'à NbLines = 0 ;
+        // AddLine ; un moteur rechargé sans Save retrouve la pièce intacte. Après Save, la pièce
+        // est relue dans un autre moteur pour vérifier le nombre de lignes (Sage peut annoncer
+        // un enregistrement sans rien changer, cf. UpdateLine sans RazLine).
+        InvoiceResult ModifyInner(InvoiceRequest req)
+        {
+            EnsureOpen();
+            var res = new InvoiceResult();
+            res.Mode = req.Mode;
+            string num = (req.Numero ?? "").Trim().ToUpperInvariant();
+            if (num.Length == 0) throw new Exception("Numéro de facture manquant.");
+            res.Numero = num;
+
+            // Seules les factures provisoires (non validées) sont modifiables.
+            PieceRow found = null;
+            foreach (PieceRow p in ListPiecesInner(null))
+                if (string.Equals(p.Num, num, StringComparison.OrdinalIgnoreCase)) { found = p; break; }
+            if (found == null) throw new Exception("Facture " + num + " introuvable dans le dossier Sage.");
+            if (found.Kind != "facture") throw new Exception("La pièce " + num + " n'est pas une facture (" + found.TypePiece + ").");
+            if (found.Soldee || found.Valide) throw new Exception("La facture " + num + " est validée : seules les factures provisoires peuvent être modifiées.");
+
+            dynamic piece = doc.CreateEngine(ENG_PIECE_CLI);
+            dynamic line = doc.CreateEngine(ENG_LIGNE_CLI);
+            dynamic verif = app.CreateVerif();
+            dynamic check = null;
+            try
+            {
+                if (!(bool)piece.Load(TYPE_FACTURE, num)) throw new Exception("Sage n'a pas pu ouvrir la facture " + num + ".");
+                string clientCode = "";
+                try { clientCode = (string)piece.Client; } catch { }
+                res.ClientCode = clientCode;
+                try { res.ClientName = (string)piece.Name; } catch { }
+                foreach (ClientRow r in ReadClients())
+                    if (string.Equals(r.Code, clientCode, StringComparison.OrdinalIgnoreCase)) { res.ClientModeTVA = r.ModeTVA; if (string.IsNullOrEmpty(res.ClientName)) res.ClientName = r.NomBrut; break; }
+                string mode = (res.ClientModeTVA ?? "").Trim();
+                bool exonere = mode.Length > 0 && !mode.Equals("Local", StringComparison.OrdinalIgnoreCase);
+                if (exonere) res.Messages.Add("Client en mode TVA « " + mode + " » : lignes facturées à 0 % de TVA.");
+                res.LinesBefore = (int)piece.NbLines;
+                double htBefore = 0; try { htBefore = (double)piece.TotalHT; } catch { }
+
+                if (req.Simulation)
+                {
+                    res.Ok = true; res.Simulated = true; res.NbLines = req.Lines.Count;
+                    double add = 0; foreach (InvoiceLine l in req.Lines) add += Math.Round(l.Qty * l.Puht, 2);
+                    res.TotalHT = req.Mode == "remplacer" ? add : htBefore + add;
+                    res.LinesAfter = req.Mode == "remplacer" ? req.Lines.Count : res.LinesBefore + req.Lines.Count;
+                    if (req.Mode == "ajouter" && req.Merge)
+                    {
+                        List<ExistingLine> ex = ReadLines(piece, line);
+                        foreach (InvoiceLine l in req.Lines)
+                        {
+                            double tv = exonere ? 0 : l.Tva;
+                            foreach (ExistingLine e in ex)
+                                if (string.Equals(e.Article.Trim(), l.Code.Trim(), StringComparison.OrdinalIgnoreCase) && l.HasPuht && Math.Abs(e.Puht - l.Puht) <= 0.00005
+                                    && (tv < 0 || Math.Abs(e.Tva - tv) <= 0.001) && MergeDesc(e.Desc, Norm.RtfToText(l.Description)) != null) { res.LinesMerged++; break; }
+                        }
+                        res.NbLines = req.Lines.Count - res.LinesMerged;
+                        res.LinesAfter = res.LinesBefore + res.NbLines;
+                        if (res.LinesMerged > 0) res.Messages.Add("Simulation : " + res.LinesMerged + " ligne(s) identique(s) verraient leur quantité augmentée.");
+                    }
+                    res.Messages.Add("Simulation : facture " + num + " (client " + clientCode + ", " + res.LinesBefore + " ligne(s)) — " +
+                        (req.Mode == "remplacer" ? "toutes ses lignes seraient remplacées par " : "on y ajouterait ") + req.Lines.Count + " ligne(s).");
+                    return res;
+                }
+
+                if (req.Mode == "remplacer")
+                {
+                    int guard = 0;
+                    while ((int)piece.NbLines > 0 && guard++ < 2000)
+                    {
+                        int nb = (int)piece.NbLines;
+                        if (!(bool)piece.LoadLine(nb, line)) throw new Exception("Impossible de lire la ligne " + nb + " de la facture " + num + ".");
+                        if (!(bool)piece.DelLine()) throw new Exception("Sage a refusé de supprimer la ligne " + nb + " de la facture " + num + ".");
+                        if ((int)piece.NbLines >= nb) throw new Exception("La ligne " + nb + " de la facture " + num + " n'a pas été supprimée.");
+                    }
+                    if ((int)piece.NbLines != 0) throw new Exception("Les lignes de la facture " + num + " n'ont pas pu être toutes supprimées.");
+                }
+
+                if (req.Mode == "ajouter" && req.Merge) AddOrMergeLines(piece, line, req, exonere, res);
+                else AddRequestLines(piece, line, req, exonere, res);
+                int expected = (req.Mode == "remplacer" ? 0 : res.LinesBefore) + res.NbLines;
+                double htExpected = -1;
+                try { res.TotalHT = (double)piece.TotalHT; htExpected = res.TotalHT; } catch { }
+                try { res.TotalTTC = (double)piece.TotalTTC; } catch { }
+
+                bool saved = (bool)piece.Save(verif);
+                try { int total = (int)verif.Total; for (int k = 1; k <= total; k++) { try { res.Messages.Add((string)verif.Desc(k)); } catch { } } } catch { }
+                if (!saved) throw new Exception("Sage a refusé l'enregistrement de la facture " + num + " : " + string.Join(" / ", res.Messages.ToArray()));
+
+                // Relecture dans un moteur neuf : la facture doit avoir le nombre de lignes attendu.
+                check = doc.CreateEngine(ENG_PIECE_CLI);
+                if (!(bool)check.Load(TYPE_FACTURE, num)) throw new SavedButUnverifiedException("Facture " + num + " enregistrée mais impossible de la relire : vérifiez-la dans Sage.");
+                res.LinesAfter = (int)check.NbLines;
+                try { res.TotalHT = (double)check.TotalHT; } catch { }
+                try { res.TotalTTC = (double)check.TotalTTC; } catch { }
+                if (res.LinesAfter != expected)
+                    throw new SavedButUnverifiedException("Sage a annoncé l'enregistrement mais la facture " + num + " a " + res.LinesAfter + " ligne(s) au lieu de " + expected + " : vérifiez-la dans Sage.");
+                // Les quantités fusionnées ne changent pas le nombre de lignes : contrôle par le total HT.
+                if (htExpected >= 0 && Math.Abs(res.TotalHT - htExpected) > 0.011)
+                    throw new SavedButUnverifiedException("Sage a annoncé l'enregistrement mais le total HT de la facture " + num + " est " + res.TotalHT.ToString("0.00") + " € au lieu de " + htExpected.ToString("0.00") + " € : vérifiez-la dans Sage.");
+                res.Ok = true;
+                return res;
+            }
+            finally
+            {
+                if (check != null) { try { Marshal.FinalReleaseComObject(check); } catch { } }
+                try { Marshal.FinalReleaseComObject(line); } catch { }
+                try { Marshal.FinalReleaseComObject(piece); } catch { }
+                try { Marshal.FinalReleaseComObject(verif); } catch { }
+            }
+        }
+
+        // Erreur levée APRÈS un Save réussi : ne jamais relancer l'opération (sinon les lignes
+        // seraient ajoutées deux fois en mode « ajouter »).
+        class SavedButUnverifiedException : Exception
+        {
+            public SavedButUnverifiedException(string m) : base(m) { }
+        }
+
         InvoiceResult CreateInner(InvoiceRequest req)
         {
+            if (!req.IsCreate) return ModifyInner(req);
             EnsureOpen();
             var res = new InvoiceResult();
             string clientCode = ResolveClient(req, res);
@@ -1812,21 +2088,7 @@ namespace SageBridge
                 if (cfg.WriteReference && !string.IsNullOrEmpty(req.Reference)) { try { piece.reference = req.Reference; } catch (Exception e) { res.Messages.Add("Référence non enregistrée : " + ComMessage(e)); } }
                 if (!string.IsNullOrEmpty(req.Remarque)) { try { piece.Remarque = req.Remarque; } catch (Exception e) { res.Messages.Add("Remarque non enregistrée : " + ComMessage(e)); } }
 
-                int n = 0;
-                foreach (InvoiceLine l in req.Lines)
-                {
-                    line.RazLine();
-                    line.Article = l.Code;
-                    line.Quantite = l.Qty;
-                    if (l.HasPuht) line.PUHT = l.Puht;   // AddLine garde ce prix (AddLineAutoCalc le remplacerait par le tarif)
-                    double tva = exonere ? 0 : l.Tva;
-                    if (tva >= 0) { try { line.TauxTVA = tva; } catch (Exception e) { res.Messages.Add("TVA ligne " + (n + 1) + " : " + ComMessage(e)); } }
-                    string desc = Norm.RtfToText(l.Description);
-                    if (!string.IsNullOrEmpty(desc)) { try { line.Description = desc; } catch (Exception e) { res.Messages.Add("Description ligne " + (n + 1) + " : " + ComMessage(e)); } }
-                    if (!(bool)piece.AddLine(line)) throw new Exception("Ligne " + (n + 1) + " (article « " + l.Code + " ») refusée par Sage : l'article existe-t-il dans le dossier ?");
-                    n++;
-                }
-                res.NbLines = n;
+                AddRequestLines(piece, line, req, exonere, res);
                 // Lire numéro et totaux AVANT Save : après Save, le moteur est vidé
                 // (« Aucune pièce client n'a été initialisée par le composant COM »).
                 try { res.Numero = (string)piece.Numero; } catch { }
@@ -2254,6 +2516,7 @@ namespace SageBridge
                     o["nbLines"] = res.NbLines; o["error"] = res.Error; o["duplicate"] = res.Duplicate; o["simulation"] = res.Simulated;
                     o["clientCode"] = res.ClientCode; o["clientName"] = res.ClientName; o["clientCreated"] = res.ClientCreated;
                     o["clientMatched"] = res.ClientMatched; o["clientModeTVA"] = res.ClientModeTVA; o["messages"] = res.Messages;
+                    o["mode"] = res.Mode; o["lignesAvant"] = res.LinesBefore; o["lignesApres"] = res.LinesAfter; o["lignesFusionnees"] = res.LinesMerged;
                     Send(resp, res.Ok ? 200 : (res.Duplicate ? 409 : 500), json.Serialize(o)); return;
                 }
                 Send(resp, 404, "{\"ok\":false,\"error\":\"Adresse inconnue\"}");
@@ -2318,6 +2581,13 @@ namespace SageBridge
             req.Site = S(d, "site"); req.OrderNo = S(d, "orderNo"); req.Client = S(d, "client");
             req.Reference = S(d, "reference"); req.Remarque = S(d, "remarque");
             req.Force = B(d, "force"); req.Simulation = B(d, "simulation");
+            string mode = S(d, "mode").ToLowerInvariant();
+            if (mode == "" || mode == "creer" || mode == "créer" || mode == "create") req.Mode = "creer";
+            else if (mode == "remplacer" || mode == "replace") req.Mode = "remplacer";
+            else if (mode == "ajouter" || mode == "append" || mode == "add") req.Mode = "ajouter";
+            else throw new Exception("Mode « " + mode + " » inconnu (creer, remplacer ou ajouter).");
+            req.Numero = S(d, "numero");
+            object fu; if (d.TryGetValue("fusionner", out fu) && fu is bool) req.Merge = (bool)fu;
             req.Customer = ParseCustomer(d, "customer");
             req.Shipping = ParseCustomer(d, "shipping");
             object lines;
@@ -2779,7 +3049,13 @@ namespace SageBridge
             if (req.Customer != null && !req.Customer.IsEmpty)
                 LogLine("Client demandé : " + req.Customer.DisplayName + ", " + req.Customer.Address1 + ", " + req.Customer.PostalCode + " " + req.Customer.City + " (" + req.Customer.Country + ")");
 
-            if (!req.Simulation && !req.Force && !string.IsNullOrEmpty(req.OrderNo))
+            if (!req.IsCreate && string.IsNullOrEmpty(req.Numero))
+            {
+                var ko = new InvoiceResult { Error = "Choisissez la facture provisoire à modifier (numéro manquant)." };
+                AddResultRow(req, ko);
+                return ko;
+            }
+            if (req.IsCreate && !req.Simulation && !req.Force && !string.IsNullOrEmpty(req.OrderNo))
             {
                 string existing = history.Existing(req.Site, req.OrderNo);
                 if (existing != null)
@@ -2790,7 +3066,8 @@ namespace SageBridge
                     return dup;
                 }
             }
-            LogLine((req.Simulation ? "Simulation : " : "Création : ") + req.Site + " " + req.OrderNo + " — " + req.Lines.Count + " ligne(s)");
+            string verb = req.IsCreate ? "Création" : (req.Mode == "remplacer" ? "Remplacement des lignes de " + req.Numero : "Ajout à " + req.Numero);
+            LogLine((req.Simulation ? "Simulation : " : "") + verb + " : " + req.Site + " " + req.OrderNo + " — " + req.Lines.Count + " ligne(s)");
             // Le callback est exécuté sur le thread worker avant même le retour de Create :
             // l'historique et le journal reflètent toujours ce que Sage a fait, y compris
             // quand l'HTTP a déjà renvoyé une erreur de timeout entre-temps.
@@ -2807,9 +3084,13 @@ namespace SageBridge
             if (res.Ok)
             {
                 if (!string.IsNullOrEmpty(req.OrderNo)) history.Add(req.Site, req.OrderNo, res.Numero, res.ClientCode, res.NbLines, res.TotalHT);
-                LogLine("Facture " + res.Numero + " créée (provisoire) — client " + res.ClientCode + (res.ClientCreated ? " (nouveau)" : "") + " — total HT " + res.TotalHT.ToString("0.00") + " €");
-                SetStatus("Dernière facture : " + res.Numero + " à " + DateTime.Now.ToString("HH:mm") + " (provisoire, à valider dans Sage)", Green);
-                Ui(delegate { try { tray.ShowBalloonTip(4000, "Facture créée dans Sage", res.Numero + " — " + res.ClientName + " (provisoire, à valider)", ToolTipIcon.Info); } catch { } });
+                string what = req.IsCreate ? "créée (provisoire)"
+                    : (req.Mode == "remplacer" ? "remplacée : " + res.LinesBefore + " ligne(s) supprimée(s), " + res.NbLines + " ajoutée(s)"
+                                               : "complétée : " + res.NbLines + " ligne(s) ajoutée(s)" + (res.LinesMerged > 0 ? ", " + res.LinesMerged + " quantité(s) augmentée(s)" : "") + ", " + res.LinesAfter + " au total");
+                LogLine("Facture " + res.Numero + " " + what + " — client " + res.ClientCode + (res.ClientCreated ? " (nouveau)" : "") + " — total HT " + res.TotalHT.ToString("0.00") + " €");
+                SetStatus("Dernière facture : " + res.Numero + " à " + DateTime.Now.ToString("HH:mm") + (req.IsCreate ? " (provisoire, à valider dans Sage)" : (req.Mode == "remplacer" ? " (lignes remplacées)" : " (lignes ajoutées)")), Green);
+                string title = req.IsCreate ? "Facture créée dans Sage" : (req.Mode == "remplacer" ? "Facture remplacée dans Sage" : "Articles ajoutés dans Sage");
+                Ui(delegate { try { tray.ShowBalloonTip(4000, title, res.Numero + " — " + res.ClientName + " (provisoire, à valider)", ToolTipIcon.Info); } catch { } });
             }
             else
             {
@@ -2838,7 +3119,8 @@ namespace SageBridge
                 it.SubItems.Add((string.IsNullOrEmpty(res.ClientCode) ? req.Client : res.ClientCode) + (res.ClientCreated ? " (nouveau)" : ""));
                 it.SubItems.Add((res.NbLines > 0 ? res.NbLines : req.Lines.Count).ToString());
                 it.SubItems.Add(res.Ok ? res.TotalHT.ToString("0.00") + " €" : "");
-                it.SubItems.Add(res.Ok ? "Créée (provisoire)" : (res.Duplicate ? "Déjà envoyée" : "Échec : " + res.Error));
+                string okText = req.IsCreate ? "Créée (provisoire)" : (req.Mode == "remplacer" ? "Lignes remplacées" : "Lignes ajoutées");
+                it.SubItems.Add(res.Ok ? okText : (res.Duplicate ? "Déjà envoyée" : "Échec : " + res.Error));
                 it.ForeColor = res.Ok ? Green : (res.Duplicate ? Orange : Red);
                 list.Items.Insert(0, it);
             });
