@@ -1,5 +1,15 @@
 # Historique des versions
 
+## 1.4.1 — 12/11/2026
+
+- **Remplacer ou compléter une facture provisoire** : `POST /facture` accepte `"mode": "remplacer"` ou `"mode": "ajouter"` avec `"numero": "FA…"`. « remplacer » supprime toutes les lignes de la facture puis met celles de la commande ; « ajouter » met les lignes de la commande à la suite. Le numéro et le client de la facture ne changent pas ; la TVA suit le mode TVA de la fiche du client (0 % hors « Local »).
+  - Refusé si la facture est validée, introuvable, ou si le numéro manque. `"simulation": true` indique ce qui serait fait sans rien modifier.
+  - Après l'enregistrement, la facture est relue pour vérifier son nombre de lignes ; en cas d'écart, l'erreur est signalée et l'opération n'est jamais relancée automatiquement (pas de lignes en double).
+  - En mode « ajouter », une ligne **identique** à une ligne déjà présente (même article, même prix HT, même TVA, même première ligne de description — désignation et référence) **augmente la quantité** de cette ligne au lieu d'en créer une nouvelle ; les lignes « Couleur xN » sont additionnées (« Doré x1 » + « Doré x3 » → « Doré x4 »). Une ligne avec remise n'est jamais fusionnée. `"fusionner": false` désactive la fusion. Contrôle après enregistrement : nombre de lignes **et** total HT. Réponse : `lignesFusionnees`.
+  - Pas de contrôle anti-doublon dans ces deux modes ; la commande est quand même inscrite dans l'historique.
+  - Réponse enrichie : `mode`, `lignesAvant`, `lignesApres`.
+  - Utilisé par l'extension « Regroupement facture » 3.40.0 (menu « Créer dans Sage »).
+
 ## 1.4.0 — 03/11/2026
 
 - **Enregistrer les factures en PDF** (nouveau bouton « Enregistrer les PDF… ») : on choisit le **mois** et l'**année**, SageBridge liste les factures et avoirs **validés** de ce mois dans Sage et indique pour chacun s'il est déjà enregistré dans le dossier des factures ou s'il manque. Ce dossier est **choisi par l'utilisateur** au premier usage (bouton « Choisir… », retenu ensuite ; aucun dossier imposé). Le bouton « Enregistrer les PDF manquants » crée ceux qui manquent, au modèle **« Format A4 Complet »** (modifiable), exactement comme à la main (Aperçu > Exporter en PDF > Exporter tout en PDF).
